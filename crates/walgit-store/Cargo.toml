@@ -1,0 +1,45 @@
+[package]
+name = "walgit-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["gcs", "s3"]
+gcs = ["dep:google-cloud-storage", "dep:google-cloud-gax", "dep:google-cloud-auth", "dep:reqwest"]
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types", "dep:reqwest"]
+
+[dependencies]
+walgit-proto.workspace = true
+walgit-config.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+uuid.workspace = true
+hex.workspace = true
+http.workspace = true
+google-cloud-storage = { workspace = true, optional = true }
+google-cloud-gax = { workspace = true, optional = true }
+google-cloud-auth = { workspace = true, optional = true }
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true
+sha1 = { workspace = true }
+bytesize = { workspace = true }
+uuid = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

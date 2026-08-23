@@ -1,0 +1,83 @@
+/* clone dropdown + copyable code samples */
+.btn-primary {
+  background: #1f883d;
+  color: #fff;
+  border-color: rgba(31, 35, 40, 0.15);
+}
+.btn-primary:hover {
+  background: #1a7f37;
+}
+.clone-menu {
+  position: relative;
+  float: right;
+  margin-top: -34px;
+}
+.clone-pop {
+  position: absolute;
+  right: 0;
+  top: 36px;
+  z-index: 20;
+  width: min(720px, 90vw);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+.clone-pop .small {
+  margin-top: 10px;
+}
+.clone-pop .small:first-child {
+  margin-top: 0;
+}
+.code-sample {
+  position: relative;
+}
+.code-sample .code-block {
+  padding-right: 64px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+.copy-btn {
+  position: absolute;
+  top: 10px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+.copy-btn-labelled,
+.clone-actions .copy-btn {
+  position: static;
+  padding: 5px 10px;
+}
+.clone-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 10px;
+}
+.clone-setup .small.strong {
+  margin-top: 12px;
+}
+.clone-setup .small.strong:first-child {
+  margin-top: 0;
+}
+.btn-small {
+  font-size: 11px;
+  padding: 5px 10px;
+}
+.copy-btn:hover {
+  background: var(--bg3);
+}

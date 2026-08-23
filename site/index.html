@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>walgit — a git server that is one binary in front of a bucket</title>
+<meta name="description" content="walgit hosts git repositories with no database, no leader and no local state that matters. One binary, one S3 or GCS bucket: smart HTTP, bundle-uri clones, LFS, a web UI and an API — and repositories larger than the machine.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#">walgit</a>
+  <nav>
+    <a href="#why">Why</a>
+    <a href="#how">How</a>
+    <a href="#run">Run it</a>
+    <a href="#auth">Auth</a>
+    <a href="#edge">Edge</a>
+    <a href="https://github.com/tobi/walgit">GitHub ↗</a>
+  </nav>
+</header>
+
+<main>
+<section class="hero">
+  <canvas id="dag" aria-hidden="true"></canvas>
+  <div class="hero-body">
+    <h1>A git server that is one binary<br>in front of a bucket.</h1>
+    <p class="lede">
+      walgit hosts git repositories with <strong>no database, no leader and no local state that matters</strong>.
+      Point it at S3 or GCS and you get smart HTTP fetch and push, clones served as static files, Git LFS,
+      a web UI, a JSON API — and repositories <em>larger than the machine that serves them</em>.
+    </p>
+<pre><code><span class="c"># 1. a config</span>
+cat &gt; walgit.toml &lt;&lt;'EOF'
+[server]
+listen = "0.0.0.0:8080"
+public_url = "https://git.example.com"
+auto_create_on_push = true
+[server.auth]
+mode = "token"
+anonymous_read = false
+tokens = [{ principal = "me", token_env = "WALGIT_TOKEN_ME", write = true }]
+[store]
+backend = "s3"
+bucket = "my-walgit"
+[store.s3]
+endpoint = "https://s3.us-east-1.amazonaws.com"
+region = "us-east-1"
+EOF
+
+<span class="c"># 2. run it</span>
+WALGIT_TOKEN_ME=$(openssl rand -hex 24) walgit serve --config walgit.toml
+
+<span class="c"># 3. use it — a push to a new name creates the repository</span>
+git push https://git.example.com/acme/app.git main</code></pre>
+    <p class="actions">
+      <a class="btn primary" href="https://github.com/tobi/walgit">Source on GitHub</a>
+      <a class="btn" href="#run">Run it in five minutes</a>
+    </p>
+  </div>
+</section>
+
+<section id="why" class="band">
+  <h2>Why a bucket</h2>
+  <div class="cols">
+    <div>
+      <h3>Hosting git is hard because of packfiles</h3>
+      <p>Every repository is compressed into large binary packs laid out to be <em>small</em>, not to be read in
+      order. Every git operation is a random walk over gigabytes. Fine on a laptop; catastrophic over a network
+      filesystem. The designs that survived keep real repositories on local NVMe and replicate at the pack level
+      with strict consistency — paid for with quorum protocols, a database that maps repositories to machines,
+      and a fleet of pets.</p>
+    </div>
+    <div>
+      <h3>Continuity's insight</h3>
+      <p>Cursor's <a href="https://cursor.com/blog/git-at-any-scale">Git at any scale</a> changes the economics:
+      <strong>make a write-ahead log in object storage the source of truth, and make every on-disk repository a
+      cache.</strong> A push is an immutable object; it becomes visible when a tiny manifest is rewritten with a
+      compare-and-swap. That CAS <em>is</em> the consensus. Any instance may accept a push. A replica that has
+      never seen a repository reads the log and has it.</p>
+    </div>
+    <div>
+      <h3>What walgit adds</h3>
+      <p>The same design on machines <em>smaller than the repository</em>: a remote reader that serves refs, the
+      UI and the API from pack indexes plus HTTP range reads; a history pack that keeps commits and trees local
+      while blobs stay in the bucket; and bundle-uri as the clone transport, so a 30 GB fresh clone touches the
+      server for a few kilobytes.</p>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="band alt">
+  <h2>How it works</h2>
+  <div class="flow">
+    <div class="node"><b>git / browser / CI</b><span>fetch · push · clone · API</span></div>
+    <div class="arrow">→</div>
+    <div class="node big"><b>walgit</b><span>any number of disposable hosts, one binary<br>refs from the WAL · small packs local · big packs by range</span></div>
+    <div class="arrow">→</div>
+    <div class="node store"><b>the bucket</b><span>S3 or GCS — <em>the repository</em><br>immutable packs · WAL · manifest CAS · bundles · LFS</span></div>
+  </div>
+  <dl class="facts">
+    <div><dt>A push</dt><dd>index the pack, check connectivity and policy, <code>PUT pack ∥ idx ∥ log</code>, then CAS the manifest. On a 412, re-read and retry. The client sees <code>ok</code> only after the bucket does.</dd></div>
+    <div><dt>A read</dt><dd>one conditional GET of the manifest — 304 means serve from the local copy, 200 means apply the new entries. There is no "eventually".</dd></div>
+    <div><dt>A clone</dt><dd>git's <code>bundle-uri</code>: the newest weekly full plus the chain of dailies and hourlies above it, straight from the bucket or a CDN; upload-pack sends only the remainder.</dd></div>
+    <div><dt>A fetch</dt><dd>the catch-up list has no fulls: a days-stale client downloads exactly the slots it missed.</dd></div>
+    <div><dt>Maintenance</dt><dd>checkpoints, bundles, compaction, base rebuilds, fsck and repair are one loop: compute the desired state from (config, WAL), do one bounded unit, under a lease. Self-healing by construction.</dd></div>
+    <div><dt>Nothing waits silently</dt><dd>slow work is a task with a progress stream, narrated to git on sideband 2 and to the browser as SSE.</dd></div>
+  </dl>
+</section>
+
+<section id="features" class="band">
+  <h2>What you get</h2>
+  <ul class="grid">
+    <li><b>Smart HTTP v0/v2</b> ls-refs with prefixes, fetch with filter/shallow/deepen, receive-pack with atomic pushes, deletes, tags, push options, report-status-v2. sha1 and sha256.</li>
+    <li><b>bundle-uri</b> weekly full, chained dailies, hourlies — cut on calendar slots as a pure function of the WAL. Blobless families for <code>--filter=blob:none</code>.</li>
+    <li><b>Git LFS</b> batch + basic transfer into the bucket; optional read-through from an upstream LFS server for imported history.</li>
+    <li><b>Web UI + API + SDK</b> tree, blob, commits, diffs, the WAL's own health page; sha-addressed answers are immutable and cached everywhere; <code>repos.js</code> for pages, agents and scripts.</li>
+    <li><b>Push policy</b> protected refs, groups, fast-forward only, bypass lists — a small rule language per repository.</li>
+    <li><b>Webhooks</b> a bridge tails the WAL and POSTs ref events with a durable cursor; exactly once per <code>(repo, seq, ref)</code>, signed.</li>
+    <li><b>Per-repo settings</b> bundle schedules, compaction, upstream follow — published into the WAL with history.</li>
+    <li><b>S3 and GCS, first class</b> AWS, MinIO, Ceph, R2, rustfs or GCS; server-side compose for the weekly bundle on both.</li>
+  </ul>
+</section>
+
+<section id="run" class="band alt">
+  <h2>Run it</h2>
+  <div class="cols">
+    <div>
+      <h3>One box</h3>
+<pre><code>just dev-store                    <span class="c"># rustfs in a container (S3-compatible)</span>
+walgit-server --config walgit.standalone.toml
+open https://walgit.localhost:8080/</code></pre>
+      <p>The standalone config terminates its own TLS (a self-signed certificate, pinned for git by the installer),
+      runs every role and streams every byte. Nothing in front.</p>
+    </div>
+    <div>
+      <h3>Get it</h3>
+<pre><code>nix run github:tobi/walgit -- --config walgit.toml
+<span class="c"># or</span>
+podman build -t walgit -f Containerfile . &amp;&amp; podman run -p 8080:8080 walgit
+<span class="c"># or</span>
+cargo build --release -p walgit-cli      <span class="c"># after `just web-build`</span></code></pre>
+      <p>Roles (<code>server.roles</code>): <code>serve</code>, <code>maintain</code>, <code>events</code>. Empty = all.
+      Any number of hosts may point at one bucket; give each repository one maintainer with placement globs.</p>
+    </div>
+  </div>
+</section>
+
+<section id="auth" class="band">
+  <h2>Authentication</h2>
+  <table>
+    <tr><th>mode</th><th>who gets in</th><th>how git authenticates</th></tr>
+    <tr><td><code>none</code></td><td>everyone is <code>anon</code> — loopback experiments</td><td>nothing</td></tr>
+    <tr><td><code>token</code></td><td>static tokens in the config, read from the environment</td><td><code>Authorization: Bearer</code> or the token as a Basic password</td></tr>
+    <tr><td><code>oidc</code></td><td>any OpenID Connect issuer: Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab…</td><td>sign in once in the browser, create a <strong>walgit access token</strong> at <code>/_auth/tokens</code>, paste it into the installer. Stateless; rotating the secret revokes all.</td></tr>
+  </table>
+  <p>Developer setup is one idempotent command —
+  <code>sh -c "$(curl -fsSL 'https://git.example.com/services/public/install.sh')"</code> — which stores the token
+  in a file only you can read, installs a tiny credential helper (on a real 401 it erases the token and tells you
+  where a new one comes from) and turns on <code>transfer.bundleURI</code>.</p>
+</section>
+
+<section id="edge" class="band alt">
+  <h2>Optional: an nginx in front</h2>
+  <p>walgit needs no proxy. Put one in front when you want public TLS from your own ACME client, one cached
+  auth verdict per credential, or <strong>byte offload</strong>: walgit still does auth, validators and 304s, but
+  answers a bundle or LFS download with <code>X-Accel-Redirect</code>; nginx fetches the object from the bucket
+  itself (S3 presigned, or GCS with walgit's bearer), slices ranges and caches it on disk. The second download of
+  a 30 GB weekly costs the walgit process nothing.</p>
+<pre><code>nginx → walgit   X-Walgit-Capabilities: accel-redirect, client-authorization
+walgit → nginx   200 + X-Accel-Redirect: /_store/
+                 X-Walgit-Store-Url: https://…        X-Walgit-Store-Key: repos/o/r/bundles/…
+                 X-Walgit-Store-Authorization: Bearer … (GCS only)</code></pre>
+  <p><a href="https://github.com/tobi/walgit/blob/main/deploy/nginx.conf.example">deploy/nginx.conf.example</a>
+  is the reference and documents the contract. Nothing is assumed from configuration: the edge announces what it
+  took over, per request.</p>
+</section>
+
+<section class="band">
+  <h2>Read more</h2>
+  <ul class="links">
+    <li><a href="https://github.com/tobi/walgit/blob/main/README.md">README</a> — the introduction, running it, the invariants.</li>
+    <li><a href="https://github.com/tobi/walgit/blob/main/AGENTS.md">AGENTS.md</a> — the architecture and every design decision with its reasoning.</li>
+    <li><a href="https://github.com/tobi/walgit/blob/main/docs/BUNDLE_URI_DESIGN.md">Bundle design</a> — slots, chains, the two lists, the numbers.</li>
+    <li><a href="https://github.com/tobi/walgit/blob/main/docs/announcing-walgit.md">The announcement post</a>.</li>
+    <li><a href="https://cursor.com/blog/git-at-any-scale">Git at any scale</a> — the design walgit descends from.</li>
+  </ul>
+</section>
+</main>
+
+<footer>walgit is MIT licensed. Built on the ideas in Cursor's Continuity; not affiliated.</footer>
+<script src="dag.js"></script>
+</body>
+</html>

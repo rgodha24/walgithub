@@ -1,0 +1,346 @@
+syntax = "proto3";
+
+package walgit.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Repository layout under <prefix> = repos/<owner>/<repo>/
+//
+//   manifest.pb            tiny, CAS-rewritten: the linearization point
+//   log/<seg:016x>.pb      LogSegment: entries [first_seq..=last_seq]
+//                          zonal bucket: one appendable object per open segment
+//                          regional bucket: immutable object per publish batch,
+//                          later merged into K-entry segments by compaction
+//   wal/<sha>.pack|.idx    immutable, content-addressed (pack checksum)
+//                          (+ .rev, .bitmap for compacted packs)
+//   checkpoints/<seq:016x>/checkpoint.pb   Checkpoint: pack set + ref snapshot ref
+//   checkpoints/<seq:016x>/refs.pb         RefSnapshot
+//   checkpoints/<seq:016x>/<sha>.bundle    optional git bundle rendered from it
+//   bundles/list.pb        BundleList (bundle-uri advertisement)
+//   leases/<name>.pb       Lease (CAS + TTL)
+//   lfs/objects/aa/bb/<oid>
+//
+// Everything except manifest.pb, bundles/list.pb and leases/* is immutable.
+// ---------------------------------------------------------------------------
+
+message Manifest {
+  // Bumped only on incompatible layout changes. Readers reject unknown values.
+  uint32 format_version = 1;
+  // "<owner>/<repo>"
+  string repo = 2;
+  // "sha1" | "sha256"
+  string object_format = 3;
+  // Sequence number of the last committed entry (0 = empty repo).
+  uint64 head_seq = 4;
+  // Oldest entry still present in `log_segments` (entries below are folded
+  // into `checkpoint`). min_seq == checkpoint.seq + 1 unless no checkpoint.
+  uint64 min_seq = 5;
+  // Latest checkpoint (may be absent for a young repo).
+  CheckpointRef checkpoint = 6;
+  // Log segments covering [min_seq, head_seq], ascending, contiguous,
+  // non-overlapping. Kept short by merging segments during compaction.
+  repeated LogSegmentRef log_segments = 7;
+  // Denormalized live pack set after applying every entry <= head_seq
+  // (checkpoint packs + packs of later PUSH entries − superseded). Sorted by
+  // seq. Materialize = these packs + checkpoint refs + replay log > checkpoint.
+  repeated PackRef packs = 8;
+  google.protobuf.Timestamp updated_at = 9;
+  // Instance id of the writer that produced this generation (diagnostics).
+  string writer = 10;
+  // Monotonic counter of successful manifest writes.
+  uint64 revision = 11;
+  // D24: per-repository settings (latest). Inline (not a pointer): every
+  // refs-level sync must see the effective config without another GET; the
+  // document is small (validated <= 16 KiB). History = SETTINGS log entries.
+  RepoSettings settings = 12;
+}
+
+// D24: per-repository settings — a TOML document restricted to the sections a
+// repository may override (`bundles`, `maintenance`, `compaction`); the
+// effective configuration is the host's walgit.toml with this merged on top
+// (`Config::with_settings`). Validated at publish; invalid settings are
+// never published.
+message RepoSettings {
+  // TOML text of the overrides.
+  string toml = 1;
+  // Monotonic per-repo settings revision (1 = first publish).
+  uint64 revision = 2;
+  // Who published (principal or instance id).
+  string author = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  // Free-text reason (shown in history).
+  string message = 5;
+}
+
+message LogSegmentRef {
+  // Object key relative to repo prefix, e.g. "log/0000000000000042.pb".
+  string key = 1;
+  uint64 first_seq = 2;
+  uint64 last_seq = 3;
+  // Bytes at the time of the manifest write (appendable segments grow; readers
+  // must read to EOF and tolerate a partial trailing frame).
+  uint64 size = 4;
+  // True once no more entries will be appended (regional: always true).
+  bool sealed = 5;
+}
+
+// Body of a log object. Encoding on the wire is a sequence of length-prefixed
+// frames (uvarint len + LogEntry bytes) so appendable objects can grow without
+// rewriting; `LogSegment` is the in-memory/decoded form and the encoding used
+// for sealed immutable segments written whole.
+message LogSegment {
+  repeated LogEntry entries = 1;
+}
+
+message PackRef {
+  // Pack checksum (trailing SHA of the .pack), hex. Object key = wal/<checksum>.pack
+  string checksum = 1;
+  uint64 pack_size = 2;
+  uint64 idx_size = 3;
+  bool has_rev = 4;
+  bool has_bitmap = 5;
+  uint64 object_count = 6;
+  // The entry that introduced this pack.
+  uint64 seq = 7;
+  // Compaction tier: 0 = fresh push pack, 1 = medium, 2 = base (checkpoint).
+  uint32 tier = 8;
+  // A commit-graph layer (git split commit-graph file) covering this pack's
+  // commits is stored at wal/<checksum>.commit-graph. Written for tier-2 bases
+  // so readers walk history without pack data.
+  bool has_commit_graph = 9;
+  // What the pack holds. OBJECTS (default) = a normal pack. HISTORY = a
+  // derived pack of the base's commits + trees (`pack-objects --filter=blob:none`),
+  // published next to a tier-2 base so instances keep every history walk local
+  // while blob data stays in the base (linked / remote). `derived_from` names
+  // the base pack; a history pack never supersedes anything and is superseded
+  // together with its base.
+  PackKind kind = 10;
+  string derived_from = 11;
+}
+
+enum PackKind {
+  PACK_KIND_OBJECTS = 0;
+  PACK_KIND_HISTORY = 1;
+}
+
+enum EntryKind {
+  ENTRY_KIND_UNSPECIFIED = 0;
+  // A push: zero or one pack + a ref transaction.
+  ENTRY_KIND_PUSH = 1;
+  // A repack: one new pack superseding `supersedes`; refs unchanged.
+  ENTRY_KIND_COMPACT = 2;
+  // A ref-only change (deletes, force-updates to existing objects, admin ops).
+  ENTRY_KIND_REF_UPDATE = 3;
+  // A checkpoint was written; `checkpoint` points at it. Packs unchanged.
+  ENTRY_KIND_CHECKPOINT = 4;
+  // D24: `settings` changed (the manifest carries the latest; this is history).
+  ENTRY_KIND_SETTINGS = 5;
+}
+
+message LogEntry {
+  uint64 seq = 1;
+  EntryKind kind = 2;
+  // Present for PUSH (when objects were pushed) and COMPACT.
+  PackRef pack = 3;
+  // Present for PUSH and REF_UPDATE.
+  RefTransaction txn = 4;
+  // COMPACT only: pack checksums removed from the live set by this entry.
+  repeated string supersedes = 5;
+  // CHECKPOINT only.
+  CheckpointRef checkpoint = 6;
+  google.protobuf.Timestamp created_at = 7;
+  string writer = 8;
+  // Free-form provenance (push-options, client agent, principal). Small.
+  map<string, string> meta = 9;
+  // ENTRY_KIND_SETTINGS: the settings as published at this seq.
+  RepoSettings settings = 10;
+}
+
+message RefUpdate {
+  // Full ref name, e.g. "refs/heads/main" or "HEAD" (symbolic target update).
+  string name = 1;
+  // Hex object ids; all-zero id means "does not exist".
+  string old_oid = 2;
+  string new_oid = 3;
+  // For symbolic refs (HEAD): the target ref name; oids are then empty.
+  string new_symbolic_target = 4;
+  // For refs/tags/* pointing at an annotated tag: the peeled commit (hex),
+  // recorded by the writer so replicas can advertise `^{}` without objects.
+  string new_peeled = 5;
+}
+
+message RefTransaction {
+  repeated RefUpdate updates = 1;
+  repeated string push_options = 2;
+  // Recorded client intent (git push --atomic). WAL application is always atomic.
+  bool atomic = 3;
+}
+
+// checkpoints/<seq>/checkpoint.pb
+message Checkpoint {
+  uint64 seq = 1;
+  string object_format = 2;
+  // Packs that fully represent the repository at `seq` (typically 1 base pack
+  // (+ 1 medium)). Keys are wal/<checksum>.pack.
+  repeated PackRef packs = 3;
+  // Key of the RefSnapshot, e.g. "checkpoints/<seq>/refs.pb".
+  string refs_key = 4;
+  uint64 ref_count = 5;
+  // Optional rendered full bundle for bundle-uri, e.g. "checkpoints/<seq>/<sha>.bundle".
+  string bundle_key = 6;
+  google.protobuf.Timestamp created_at = 7;
+  string writer = 8;
+}
+
+message CheckpointRef {
+  uint64 seq = 1;
+  // "checkpoints/<seq:016x>/checkpoint.pb"
+  string key = 2;
+  // When the checkpoint was written (drives the time-based trigger without
+  // fetching the checkpoint object).
+  google.protobuf.Timestamp created_at = 3;
+  // Earliest WAL state this repository ever had (carried forward from the
+  // previous checkpoint, else the first folded entry's created_at): bundle
+  // slots before it are "unavailable"; slots after it are backfillable even
+  // on a maintainer that cold-starts from this checkpoint (D22).
+  google.protobuf.Timestamp first_state_at = 4;
+  // created_at of the newest entry this checkpoint folded: the state it holds
+  // is the repository "as of" this instant (≠ created_at, the write time).
+  google.protobuf.Timestamp as_of = 5;
+}
+
+message RefSnapshot {
+  uint64 seq = 1;
+  string object_format = 2;
+  // Sorted by name, no duplicates.
+  repeated Ref refs = 3;
+  // Symbolic target of HEAD, e.g. "refs/heads/main".
+  string head_target = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message Ref {
+  string name = 1;
+  string oid = 2;
+  // Peeled tag target if `name` points to an annotated tag (hex), else empty.
+  string peeled = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Coordination primitives: leases/<name>.pb
+// ---------------------------------------------------------------------------
+
+message Lease {
+  string holder = 1;
+  string purpose = 2;
+  google.protobuf.Timestamp acquired_at = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  // Incremented on every heartbeat.
+  uint64 epoch = 5;
+}
+
+// ---------------------------------------------------------------------------
+// bundle-uri: bundles/list.pb
+// ---------------------------------------------------------------------------
+
+message BundleList {
+  // "all" | "any" (git bundle.mode)
+  string mode = 1;
+  // "creationToken"
+  string heuristic = 2;
+  repeated BundleEntry bundles = 3;
+  google.protobuf.Timestamp updated_at = 4;
+  // Closed slots measured and NOT cut (too small / no state as of the slot):
+  // final for (strategy, slot, base_id) — every host and every restart skips
+  // them in O(1) instead of re-measuring (a unit's worth of work each; after
+  // a restart the SSD host re-walked ~30 of them before reaching the live slot,
+  // 2026-08-21). A new base bundle for the slot re-opens the question.
+  repeated SkippedSlot skipped = 5;
+}
+
+message SkippedSlot {
+  string strategy = 1;
+  uint64 slot = 2;
+  // The base bundle the measurement was against ("" for a full / no-state).
+  string base_id = 3;
+  // WAL seq the slot resolved to when measured (0 = no state).
+  uint64 as_of_seq = 4;
+  // "too-small: N commits (min M)" | "no state as of the slot"
+  string reason = 5;
+  google.protobuf.Timestamp at = 6;
+}
+
+message BundleEntry {
+  // Stable id used in `bundle.<id>.uri`.
+  string id = 1;
+  // Object key relative to repo prefix.
+  string key = 2;
+  string strategy = 3;
+  // "full" | "incremental"
+  string kind = 4;
+  // Monotonic; git downloads bundles with creationToken > what it has.
+  uint64 creation_token = 5;
+  // WAL seq the bundle was created from.
+  uint64 seq = 6;
+  uint64 size = 7;
+  // Id of the bundle this incremental one is based on (empty for full).
+  string base_id = 8;
+  google.protobuf.Timestamp created_at = 9;
+  // Object store version tag (ETag/generation) at upload; used for HTTP ETag.
+  string version = 10;
+  // Ref tips the bundle contains (refs/heads/*, refs/tags/*, HEAD). For
+  // incremental bundles, the base bundle's tips are the prerequisites.
+  repeated Ref tips = 11;
+  // Calendar slot this bundle was cut for (epoch seconds of the schedule
+  // fire time); `creation_token` equals it. Content = ref state at the WAL
+  // seq as of the slot (`seq`), not "now" — a backfilled Tuesday bundle is
+  // Tuesday's main. 0 for bundles built before slots existed.
+  uint64 slot = 12;
+  // Object filter of the bundle's pack ("" = none, "blob:none" = the blobless
+  // family): advertised as `bundle.<id>.filter` at `bundles/list?filter=…`
+  // and never in the unfiltered list.
+  string filter = 13;
+}
+
+// Result of the last connectivity audit of a repository: repos/<o>/<r>/fsck.pb.
+// Written by the maintainer's `fsck` unit (git fsck --connectivity-only over a
+// complete local copy), consumed by the `repair` unit (fetch `missing` from
+// upstream.git, publish as a pack) and by `walgit_repo_missing_objects{repo}`.
+// Not WAL state: overwritten, never replayed.
+message FsckReport {
+  // WAL seq the audited copy had applied.
+  uint64 seq = 1;
+  google.protobuf.Timestamp at = 2;
+  string host = 3;
+  // Objects reachable from refs that are in no live pack (bounded list).
+  repeated string missing = 4;
+  uint64 missing_total = 5;
+  // Other fsck problems (corrupt objects etc.), count only.
+  uint64 problems = 6;
+  double elapsed_secs = 7;
+  // Set by the repair unit: the seq whose COMPACT entry brought `missing` back.
+  uint64 repaired_seq = 8;
+}
+
+// Optional catalog: meta/repos.pb (CAS). Not required for correctness.
+message RepoCatalog {
+  repeated string repos = 1;
+  google.protobuf.Timestamp updated_at = 2;
+}
+
+// Maintainer heartbeat at `maintain/<host>.pb` (bucket root, not per repo):
+// who maintains what, with what capacity, and whether that host is alive.
+// `bundle plan` / the WAL page show the responsible host per repository.
+message MaintainerHeartbeat {
+  string host = 1;
+  repeated string repos = 2;
+  repeated string exclude = 3;
+  uint64 max_pack_bytes = 4;
+  string disk = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp last_pass_at = 7;
+  // Last unit done: "<repo> <kind> <detail>".
+  string last_unit = 8;
+  uint64 passes = 9;
+}

@@ -1,0 +1,227 @@
+# deploy/nginx.conf.example — a suggested nginx in front of walgit.
+#
+# walgit does not need a proxy: `walgit serve` terminates TLS itself, streams every
+# byte and authenticates every request. Put nginx in front when you want one of:
+#
+#   1. Public TLS with your own certificates / ACME client, HTTP/2 + HTTP/3, rate limits.
+#   2. **Byte offload with a disk cache (`X-Accel-Redirect`)**: clone bundles and LFS
+#      objects are big, immutable and content-addressed. With this config walgit still
+#      does auth, existence, validators and 304s, but answers the *bytes* with an
+#      internal redirect; nginx fetches the object from the bucket itself (S3 or GCS),
+#      slices ranges, and keeps it on local disk. A 30 GB weekly bundle then costs the
+#      walgit process nothing per download, and the second download is served from the
+#      edge's disk.
+#   3. One `auth_request` verdict per credential cached for a few minutes, so a clone
+#      that opens many connections (every bundle is its own `git-remote-https`) does not
+#      verify the same token many times.
+#   4. Routing several repositories to several walgit hosts by the repository prefix
+#      (`/<owner>/<repo>` is the only routing key walgit needs; nothing else).
+#
+# The contract between the two is announced **per request**, never assumed from config:
+#
+#   nginx → walgit    X-Walgit-Capabilities: accel-redirect, client-authorization
+#                     X-Walgit-Authorization: <the client's Authorization header>
+#   walgit → nginx    200 + X-Accel-Redirect: /_store/
+#                     X-Walgit-Store-Url:            https://… (the object; S3: presigned, GCS: plain)
+#                     X-Walgit-Store-Authorization:  Bearer … (GCS only; S3 URLs are self-credentialed)
+#                     X-Walgit-Store-Key:            <bucket key, percent-encoded> (the cache key)
+#                     X-Walgit-Etag:                 "<walgit's strong validator>"
+#                     + Content-Type, Cache-Control (immutable), Accept-Ranges
+#
+# Set `server.accel_redirect = true` in walgit.toml **only** on hosts reached through
+# this nginx: the accel answer carries a store credential, and nginx below clears the
+# capability header from clients so nobody can ask for it directly.
+#
+# Needs nginx with ngx_http_slice_module and ngx_http_auth_request_module (both in the
+# nginx.org packages and Debian/Ubuntu `nginx-full`; on nixpkgs: `nginx.override { withSlice = true; }`).
+# Test the rendered file with `nginx -t -c $PWD/deploy/nginx.conf.example` after filling in
+# the CHANGEME values.
+
+worker_processes auto;
+events { worker_connections 4096; }
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    sendfile      on;
+    tcp_nopush    on;
+
+    # ---- walgit upstream(s) -------------------------------------------------------
+    # One box: one upstream. Several boxes: keep one upstream per group of repositories
+    # and route with `location ~ ^/acme/monorepo([./?]|$)` blocks below (the repo prefix
+    # is the routing key; `.git`, `/api`, bundles and LFS all live under it).
+    upstream walgit {
+        server 127.0.0.1:8080;          # walgit serve, server.tls.mode = "off" (h2c)
+        keepalive 64;
+    }
+
+    # ---- caches -----------------------------------------------------------------------
+    # auth:  one /_auth/check verdict per credential, 5 min (a 401/403 only 5 s).
+    # store: immutable bucket bytes by object key + slice; size it to your disk.
+    proxy_cache_path /var/cache/nginx/walgit-auth  levels=1   keys_zone=walgit_auth:32m  inactive=10m max_size=256m;
+    proxy_cache_path /var/cache/nginx/walgit-store levels=1:2 keys_zone=walgit_store:512m inactive=30d max_size=500g use_temp_path=off;
+
+    # Fetching from the bucket by a URL walgit hands us needs a resolver for `proxy_pass $var`.
+    resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+    resolver_timeout 5s;
+
+    # Let the client's Authorization through untouched on most paths; `$client_auth` is
+    # what we copy into X-Walgit-Authorization so walgit always knows which header is
+    # the client's even if a hop in between (e.g. a cloud IAM proxy) rewrites Authorization.
+    map $http_authorization $client_auth { default $http_authorization; }
+
+    server {
+        listen 443 ssl;
+        listen [::]:443 ssl;
+        http2 on;
+        server_name git.example.com;                                  # CHANGEME
+
+        ssl_certificate     /etc/letsencrypt/live/git.example.com/fullchain.pem;   # CHANGEME
+        ssl_certificate_key /etc/letsencrypt/live/git.example.com/privkey.pem;     # CHANGEME
+        ssl_protocols TLSv1.2 TLSv1.3;
+
+        # git pushes and LFS uploads are big and streamed; never buffer them to disk here.
+        client_max_body_size 0;
+        proxy_request_buffering off;
+        proxy_http_version 1.1;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # ---- what every proxied request to walgit carries -----------------------------
+        # (nginx does not inherit proxy_set_header across levels when a block sets any; the
+        # common set is repeated through this `include`-style snippet via a map-free macro:
+        # copy the block where needed.)
+        #
+        #   proxy_set_header Host $host;
+        #   proxy_set_header X-Forwarded-Proto https;
+        #   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        #   proxy_set_header X-Walgit-Capabilities "accel-redirect, client-authorization";
+        #   proxy_set_header X-Walgit-Authorization $client_auth;
+        #   proxy_set_header X-Walgit-Principal "";        # only walgit's own broker path may carry it
+        #   proxy_set_header Connection "";
+
+        # ---- auth_request: one verdict per credential ---------------------------------
+        # walgit's /_auth/check answers 204 + X-Walgit-Principal, or 401/403/503, with no body.
+        # Everything under / (except the open routes below) asks it first. A denied browser
+        # navigation is sent to sign in; everything else gets the 401 (git then asks its helper).
+        location = /_auth/check {
+            internal;
+            proxy_pass http://walgit;
+            proxy_pass_request_body off;
+            proxy_set_header Content-Length "";
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Walgit-Capabilities "client-authorization";
+            proxy_set_header X-Walgit-Authorization $client_auth;
+            proxy_set_header X-Original-URI $request_uri;
+            proxy_cache walgit_auth;
+            proxy_cache_key "$http_authorization|$cookie_walgit_session";
+            proxy_cache_valid 204 5m;
+            proxy_cache_valid 401 403 5s;
+            proxy_cache_lock on;
+        }
+        location @need_signin {
+            # Browsers: go sign in and come back. Everyone else: a real 401 (git erases a dead token on it).
+            if ($http_accept ~* "text/html") { return 302 /_auth/login?next=$request_uri; }
+            add_header WWW-Authenticate 'Bearer realm="walgit"' always;
+            return 401;
+        }
+
+        # ---- open routes: health, the installer, the SDK, sign-in ---------------------
+        location ~ ^/(healthz|readyz|repos\.js|repos\.mjs)$ { proxy_pass http://walgit; proxy_set_header Host $host; }
+        location ^~ /services/public/                           { proxy_pass http://walgit; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto https; }
+        location ^~ /_auth/ {
+            # The sign-in flow itself (login, callback, tokens page): walgit authenticates it.
+            proxy_pass http://walgit;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Walgit-Capabilities "client-authorization";
+            proxy_set_header X-Walgit-Authorization $client_auth;
+            proxy_set_header Connection "";
+        }
+
+        # ---- everything else: repositories, API, UI, git, bundles, LFS -------------------
+        location / {
+            auth_request /_auth/check;
+            error_page 401 = @need_signin;
+
+            proxy_pass http://walgit;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            # Announce what this edge takes over. walgit trusts these headers because *this*
+            # hop set them; the capability header from a client is overwritten here.
+            proxy_set_header X-Walgit-Capabilities "accel-redirect, client-authorization";
+            proxy_set_header X-Walgit-Authorization $client_auth;
+            proxy_set_header X-Walgit-Principal "";
+            proxy_set_header Connection "";
+            proxy_buffering off;               # git and SSE are streams
+        }
+
+        # ---- X-Accel-Redirect target: the bucket, cached on disk --------------------------
+        # Reached only through walgit's answer (`internal`), after it authorized the caller.
+        location /_store/ {
+            internal;
+            # walgit's answer headers are the MAIN request's upstream headers. The bucket fetches
+            # below run as `slice` SUBREQUESTS where $upstream_http_* is empty, so capture what we
+            # need now, in the parent's rewrite phase.
+            set $store_url  $upstream_http_x_walgit_store_url;
+            set $store_auth $upstream_http_x_walgit_store_authorization;
+            set $store_key  $upstream_http_x_walgit_store_key;
+            set $walgit_etag $upstream_http_x_walgit_etag;
+
+            # Range requests are sliced into 64 MiB pieces so a resumed 30 GB download hits the cache.
+            # Works for S3 presigned URLs too: `Range` is not a signed header.
+            slice 64m;
+            proxy_pass $store_url;
+            proxy_set_header Range $slice_range;
+            proxy_set_header Authorization $store_auth;      # GCS: walgit's bearer. S3: empty (presigned URL).
+            proxy_set_header Host $proxy_host;
+            proxy_set_header Cookie "";
+            proxy_set_header Connection "";
+            proxy_set_header X-Walgit-Capabilities "";
+            # Conditionals were decided by walgit against ITS validator (a 304 happens before the
+            # redirect); the bucket must never see them (its ETag is a different value).
+            proxy_set_header If-Range "";  proxy_set_header If-None-Match ""; proxy_set_header If-Match "";
+            proxy_set_header If-Modified-Since ""; proxy_set_header If-Unmodified-Since "";
+
+            proxy_buffering on;                 # proxy_cache needs it; bytes leave via sendfile
+            proxy_max_temp_file_size 0;
+            proxy_cache walgit_store;
+            proxy_cache_key "$store_key$slice_range";       # the object, not the (changing, presigned) URL
+            proxy_cache_valid 200 206 30d;
+            proxy_cache_lock on; proxy_cache_lock_timeout 120s; proxy_cache_lock_age 120s;
+            proxy_cache_use_stale updating error timeout;
+            proxy_ignore_headers Cache-Control Expires Set-Cookie;
+
+            # One Cache-Control and one validator set, walgit's: nginx carries the accel answer's
+            # Cache-Control/Content-Type/Accept-Ranges over the internal redirect; hide the bucket's.
+            proxy_hide_header Cache-Control; proxy_hide_header Expires;
+            proxy_hide_header ETag; proxy_hide_header Last-Modified;
+            add_header ETag $walgit_etag always;            # the range filter evaluates If-Range against it → 206
+            proxy_hide_header x-goog-hash; proxy_hide_header x-goog-generation; proxy_hide_header x-goog-metageneration;
+            proxy_hide_header x-goog-stored-content-length; proxy_hide_header x-goog-stored-content-encoding;
+            proxy_hide_header x-goog-storage-class; proxy_hide_header x-goog-component-count; proxy_hide_header x-goog-crc32c;
+            proxy_hide_header x-amz-request-id; proxy_hide_header x-amz-id-2; proxy_hide_header x-amz-server-side-encryption;
+            proxy_hide_header x-amz-version-id; proxy_hide_header alt-svc;
+            add_header X-Cache $upstream_cache_status;
+
+            # The bucket refusing walgit's credential is our fault, not the client's.
+            proxy_intercept_errors on;
+            error_page 401 403 = @store_denied;
+        }
+        location @store_denied {
+            internal;
+            default_type text/plain;
+            return 502 "walgit-edge: the bucket rejected the credential walgit attached to its X-Accel-Redirect answer (X-Walgit-Store-Authorization missing/expired, or the presigned URL expired).\n";
+        }
+    }
+
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name git.example.com;                                  # CHANGEME
+        return 301 https://$host$request_uri;
+    }
+}

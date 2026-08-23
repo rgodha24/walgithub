@@ -1,0 +1,140 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/walgit-proto",
+    "crates/walgit-store",
+    "crates/walgit-config",
+    "crates/walgit-git",
+    "crates/walgit-wal",
+    "crates/walgit-server",
+    "crates/walgit-bundle",
+    "crates/walgit-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+walgit-proto = { path = "crates/walgit-proto" }
+walgit-store = { path = "crates/walgit-store" }
+walgit-config = { path = "crates/walgit-config" }
+walgit-git = { path = "crates/walgit-git" }
+walgit-wal = { path = "crates/walgit-wal" }
+walgit-server = { path = "crates/walgit-server" }
+walgit-bundle = { path = "crates/walgit-bundle" }
+
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+rust-embed = "8"
+prost = "0.14"
+prost-types = "0.14"
+prost-build = "0.14"
+tonic = "0.14"
+axum = { version = "0.8", features = ["http2", "macros"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "compression-gzip", "compression-br", "decompression-gzip", "timeout", "limit", "catch-panic", "set-header"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+gix = { version = "0.86", default-features = false, features = ["sha1", "sha256", "max-performance-safe", "blocking-network-client", "parallel", "revision", "interrupt", "worktree-mutation", "index"] }
+gix-pack = { version = "0.73", features = ["streaming-input", "object-cache-dynamic", "generate"] }
+gix-hash = { version = "0.26", features = ["sha1", "sha256"] }
+gix-object = "0.63"
+gix-features = { version = "0.49", features = ["parallel", "walkdir", "progress"] }
+gix-packetline = { version = "0.22", features = ["blocking-io"] }
+gix-packetline-blocking = "0.22"
+gix-protocol = { version = "0.64", features = ["blocking-client"] }
+gix-transport = { version = "0.58", features = ["blocking-client"] }
+gix-ref = "0.66"
+gix-odb = "0.83"
+gix-traverse = "0.60"
+gix-revwalk = "0.34"
+gix-negotiate = "0.34"
+gix-commitgraph = "0.38"
+gix-tempfile = "24"
+gix-lock = "24"
+gix-date = "0.15"
+gix-actor = "0.41"
+gix-hashtable = "0.16"
+gix-validate = "0.11"
+google-cloud-storage = "1"
+google-cloud-gax = "1"
+google-cloud-auth = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-smithy-types = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+humantime = "2"
+humantime-serde = "1"
+bytesize = { version = "2", features = ["serde"] }
+cron = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dashmap = "6"
+parking_lot = "0.12"
+moka = { version = "0.12", features = ["sync"] }
+mimalloc = "0.1"
+tempfile = "3"
+flate2 = "1"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+pin-project-lite = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+base64 = "0.22"
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+libc = "0.2"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
+# TLS (in-process termination)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "logging", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+
+[profile.release]
+# thin LTO + a few codegen units: near-fat performance, much faster rebuilds
+lto = "thin"
+codegen-units = 8
+opt-level = 3
+debug = 1
+# unwind: a panic in one request task must not take down an instance serving
+# many concurrent git operations (tokio isolates task panics; CatchPanicLayer -> 500).
+panic = "unwind"
+
+[profile.dev]
+# Full debuginfo on this graph (gix, aws-sdk, prost, axum, …) makes every
+# cold `cargo test` in a worktree spend minutes in LLVM + linking. Line tables
+# keep usable panic backtraces; `CARGO_PROFILE_DEV_DEBUG=2` restores full info.
+debug = "line-tables-only"
+
+# Deps stay optimized so gix/git-heavy tests stay fast; workspace crates stay
+# opt-level 0 (the default) so our own edit-compile cycle is cheap.
+[profile.dev.package."*"]
+opt-level = 2
+debug = "line-tables-only"
+
+# `package."*"` would otherwise opt-2 proc-macros and build.rs too — the
+# usual compile-time footgun, with no test-runtime payoff.
+[profile.dev.build-override]
+opt-level = 0
+debug = 0

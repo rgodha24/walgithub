@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <title>walgit</title>
+    <style>
+      /* Pre-JS boot state: painted from the HTML alone, replaced by the app on mount. */
+      .boot { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; color: #1f2328; }
+      .boot-bar { height: 56px; border-bottom: 1px solid #d1d9e0; background: #f6f8fa; }
+      .boot-main { max-width: 1280px; margin: 24px auto; padding: 0 24px; }
+      .boot-sk { border-radius: 6px; background: linear-gradient(90deg, #eaeef2 25%, #f6f8fa 50%, #eaeef2 75%); background-size: 400% 100%; animation: boot-sh 1.4s ease infinite; }
+      @keyframes boot-sh { from { background-position: 100% 0 } to { background-position: 0 0 } }
+      @media (prefers-reduced-motion: reduce) { .boot-sk { animation: none } }
+    </style>
+  </head>
+  <body>
+    <div id="root">
+      <div class="boot" aria-busy="true" aria-label="Loading walgit">
+        <div class="boot-bar"></div>
+        <div class="boot-main">
+          <div class="boot-sk" style="height:22px;width:240px;margin:4px 0 16px"></div>
+          <div class="boot-sk" style="height:12px;width:70%;margin:11px 0"></div>
+          <div class="boot-sk" style="height:12px;width:55%;margin:11px 0"></div>
+          <div class="boot-sk" style="height:12px;width:80%;margin:11px 0"></div>
+          <div class="boot-sk" style="height:12px;width:60%;margin:11px 0"></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

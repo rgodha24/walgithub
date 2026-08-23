@@ -1,0 +1,52 @@
+[package]
+name = "walgit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "walgit"
+
+[lib]
+name = "walgit_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "walgit"
+path = "src/bin/walgit.rs"
+
+[[bin]]
+name = "walgit-server"
+path = "src/bin/walgit-server.rs"
+
+[dependencies]
+walgit-proto.workspace = true
+walgit-store.workspace = true
+walgit-config.workspace = true
+walgit-git.workspace = true
+walgit-wal.workspace = true
+walgit-server.workspace = true
+walgit-bundle = { path = "../walgit-bundle", features = ["wal"] }
+gix-hash.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+clap.workspace = true
+mimalloc.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+sha1.workspace = true
+hex.workspace = true
+chrono.workspace = true
+humantime.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+axum.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]

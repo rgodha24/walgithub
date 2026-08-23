@@ -1,0 +1,257 @@
+From ca1ef1193d20947df67ea250bcbb79f7cc7d6801 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Tobi=20L=C3=BCtke?= <tobi@users.noreply.github.com>
+Date: Fri, 21 Aug 2026 09:44:15 -0400
+Subject: [PATCH] bundle-uri: use a bundle only when its filter matches the
+ clone's
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The bundle list format documents 'bundle.<id>.filter' ("The server uses
+this value to differentiate different kinds of bundles from which the
+client can choose those that match their object filters"), but the
+client never read it: every advertised bundle was downloaded and
+unbundled regardless. Two consequences on a server that offers both a
+whole-history family and a 'blob:none' family:
+
+ * 'git clone --filter=blob:none' downloads the full bundles — for
+   a 57 GiB monorepo 32 GB of blobs it did not ask for, plus 17 minutes of
+   index-pack — before fetching the rest lazily anyway;
+
+ * a plain 'git clone' unbundles the filtered bundles too
+   ('index-pack --promisor=from-bundle') and ends up a non-partial
+   clone holding promisor packs with objects it can never fetch
+   (observed: 3 promisor packs and 3 missing objects in a full clone).
+
+Parse 'bundle.<id>.filter' into remote_bundle_info and, before any
+bundle is downloaded (creationToken path and mode=all path, nested
+lists included), drop the bundles whose filter differs from the
+repository's partial-clone filter; no filter matches no filter.
+
+'git clone --filter' registers the promisor remote only after bundles
+are fetched, so clone passes its filter spec to bundle_uri_set_filter()
+first; 'git fetch' reads the repository's partialclonefilter. Skipped
+bundles are recorded as trace2 data 'bundle-uri/filter-skip'.
+
+Tested against walgit (tests/git-bundle-filter.sh there): one list with
+both families — a full clone takes only the unfiltered bundles (0
+promisor packs, fsck clean), a --filter=blob:none clone only the history
+ones (promisor packs from bundles, blobs lazy on checkout), a stale
+blobless fetch only the newer history incrementals.
+---
+ builtin/clone.c |   2 +
+ bundle-uri.c    | 103 ++++++++++++++++++++++++++++++++++++++++++++++--
+ bundle-uri.h    |  21 ++++++++++
+ 3 files changed, 123 insertions(+), 3 deletions(-)
+
+diff --git a/builtin/clone.c b/builtin/clone.c
+index 5b25cca510..c4e7f1af43 100644
+--- a/builtin/clone.c
++++ b/builtin/clone.c
+@@ -1397,6 +1397,8 @@ int cmd_clone(int argc,
+ 		transport_set_option(transport, TRANS_OPT_LIST_OBJECTS_FILTER,
+ 				     spec);
+ 		transport_set_option(transport, TRANS_OPT_FROM_PROMISOR, "1");
++		/* bundles advertised with a filter are used iff it matches */
++		bundle_uri_set_filter(spec);
+ 	}
+ 
+ 	if (transport->smart_options && !deepen && !filter_options.choice)
+diff --git a/bundle-uri.c b/bundle-uri.c
+index 2bb2eb99e4..04eaa3d485 100644
+--- a/bundle-uri.c
++++ b/bundle-uri.c
+@@ -15,6 +15,7 @@
+ #include "remote.h"
+ #include "trace2.h"
+ #include "odb.h"
++#include "promisor-remote.h"
+ 
+ static struct {
+ 	enum bundle_list_heuristic heuristic;
+@@ -54,6 +55,7 @@ static int clear_remote_bundle_info(struct remote_bundle_info *bundle,
+ 	FREE_AND_NULL(bundle->id);
+ 	FREE_AND_NULL(bundle->uri);
+ 	FREE_AND_NULL(bundle->file);
++	FREE_AND_NULL(bundle->filter);
+ 	bundle->unbundled = 0;
+ 	return 0;
+ }
+@@ -223,6 +225,12 @@ static int bundle_list_update(const char *key, const char *value,
+ 		return 0;
+ 	}
+ 
++	if (!strcmp(subkey, "filter")) {
++		free(bundle->filter);
++		bundle->filter = *value ? xstrdup(value) : NULL;
++		return 0;
++	}
++
+ 	/*
+ 	 * At this point, we ignore any information that we don't
+ 	 * understand, assuming it to be hints for a heuristic the client
+@@ -537,6 +545,89 @@ static int compare_creation_token_decreasing(const void *va, const void *vb)
+ 	return 0;
+ }
+ 
++/*
++ * The repository's partial-clone filter spec ("blob:none", ...), or NULL
++ * when it is not a partial clone. During "git clone --filter=<f>" the
++ * promisor remote is registered before bundles are fetched, so this is
++ * the clone's filter too.
++ */
++static char *bundle_uri_clone_filter;
++
++void bundle_uri_set_filter(const char *spec)
++{
++	free(bundle_uri_clone_filter);
++	bundle_uri_clone_filter = (spec && *spec) ? xstrdup(spec) : NULL;
++}
++
++static const char *repo_partial_clone_filter(struct repository *r)
++{
++	struct promisor_remote *p;
++
++	/*
++	 * "git clone --filter=<f>" registers the promisor remote only after
++	 * the bundles are fetched (builtin/clone.c), so clone tells us.
++	 */
++	if (bundle_uri_clone_filter)
++		return bundle_uri_clone_filter;
++	if (!r->repository_format_partial_clone)
++		return NULL;
++	p = repo_promisor_remote_find(r, r->repository_format_partial_clone);
++	if (!p || !p->partial_clone_filter || !*p->partial_clone_filter)
++		return NULL;
++	return p->partial_clone_filter;
++}
++
++struct filter_prune_context {
++	const char *filter;
++	struct remote_bundle_info **drop;
++	size_t nr, alloc;
++};
++
++static int collect_filter_mismatch(struct remote_bundle_info *bundle,
++				   void *data)
++{
++	struct filter_prune_context *ctx = data;
++	int matches;
++
++	if (!bundle->filter)
++		matches = !ctx->filter;
++	else
++		matches = ctx->filter && !strcmp(bundle->filter, ctx->filter);
++
++	if (!matches) {
++		ALLOC_GROW(ctx->drop, ctx->nr + 1, ctx->alloc);
++		ctx->drop[ctx->nr++] = bundle;
++	}
++	return 0;
++}
++
++/*
++ * Drop from 'list' every bundle whose advertised object filter differs
++ * from the repository's partial-clone filter (none == none). A bundle
++ * list may then carry several families at once (the whole history and a
++ * "blob:none" history) and each clone takes only its own.
++ */
++static void prune_bundles_by_filter(struct repository *r,
++				    struct bundle_list *list)
++{
++	struct filter_prune_context ctx = {
++		.filter = repo_partial_clone_filter(r),
++	};
++	size_t i;
++
++	for_all_bundles_in_list(list, collect_filter_mismatch, &ctx);
++	for (i = 0; i < ctx.nr; i++) {
++		struct remote_bundle_info *bundle = ctx.drop[i];
++
++		trace2_data_string("bundle-uri", r, "filter-skip",
++				   bundle->id ? bundle->id : "");
++		hashmap_remove(&list->bundles, &bundle->ent, NULL);
++		clear_remote_bundle_info(bundle, NULL);
++		free(bundle);
++	}
++	free(ctx.drop);
++}
++
+ static int fetch_bundles_by_token(struct repository *r,
+ 				  struct bundle_list *list)
+ {
+@@ -553,6 +644,8 @@ static int fetch_bundles_by_token(struct repository *r,
+ 		.alloc = hashmap_get_size(&list->bundles),
+ 	};
+ 
++	prune_bundles_by_filter(r, list);
++	bundles.alloc = hashmap_get_size(&list->bundles);
+ 	ALLOC_ARRAY(bundles.items, bundles.alloc);
+ 
+ 	for_all_bundles_in_list(list, append_bundle, &bundles);
+@@ -732,9 +825,12 @@ static int fetch_bundle_list_in_config_format(struct repository *r,
+ 	if (list_from_bundle.heuristic == BUNDLE_HEURISTIC_CREATIONTOKEN) {
+ 		result = fetch_bundles_by_token(r, &list_from_bundle);
+ 		global_list->heuristic = BUNDLE_HEURISTIC_CREATIONTOKEN;
+-	} else if ((result = download_bundle_list(r, &list_from_bundle,
+-					   global_list, depth)))
+-		goto cleanup;
++	} else {
++		prune_bundles_by_filter(r, &list_from_bundle);
++		if ((result = download_bundle_list(r, &list_from_bundle,
++						   global_list, depth)))
++			goto cleanup;
++	}
+ 
+ cleanup:
+ 	clear_bundle_list(&list_from_bundle);
+@@ -908,6 +1004,7 @@ int fetch_bundle_list(struct repository *r, struct bundle_list *list)
+ 	/* If a bundle is added to this global list, then it is required. */
+ 	global_list.mode = BUNDLE_MODE_ALL;
+ 
++	prune_bundles_by_filter(r, list);
+ 	if ((result = download_bundle_list(r, list, &global_list, 0)))
+ 		goto cleanup;
+ 
+diff --git a/bundle-uri.h b/bundle-uri.h
+index 6dbc780f66..571d5aead2 100644
+--- a/bundle-uri.h
++++ b/bundle-uri.h
+@@ -37,6 +37,17 @@ struct remote_bundle_info {
+ 	 */
+ 	char *file;
+ 
++	/**
++	 * The object filter the bundle was created with, as advertised by
++	 * "bundle.<id>.filter" (for example "blob:none"). NULL when the list
++	 * advertised none: the bundle holds every object. A bundle is used
++	 * only when this equals the repository's partial-clone filter
++	 * (none == none): an unfiltered clone must not seed itself from a
++	 * blobless bundle (it would hold promisor packs it cannot complete),
++	 * and a blobless clone gains nothing from downloading every blob.
++	 */
++	char *filter;
++
+ 	/**
+ 	 * If the bundle has been unbundled successfully, then
+ 	 * this boolean is true.
+@@ -144,6 +155,16 @@ int fetch_bundle_uri(struct repository *r, const char *uri,
+  * Returns non-zero if there was an error trying to download the list
+  * or any of its advertised bundles.
+  */
++/**
++ * Tell the bundle-uri client the object filter of the clone in progress
++ * ("blob:none", ...; NULL or "" = none) so bundles advertised with
++ * "bundle.<id>.filter" are matched against it. "git clone --filter"
++ * registers the promisor remote only after bundles are fetched, so it
++ * must say so up front; "git fetch" needs nothing — the repository's
++ * partial-clone filter is read from its config.
++ */
++void bundle_uri_set_filter(const char *spec);
++
+ int fetch_bundle_list(struct repository *r,
+ 		      struct bundle_list *list);
+ 
+-- 
+2.54.0
+

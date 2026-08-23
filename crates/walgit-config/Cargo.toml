@@ -1,0 +1,14 @@
+[package]
+name = "walgit-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+cron.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+humantime-serde.workspace = true
+bytesize.workspace = true

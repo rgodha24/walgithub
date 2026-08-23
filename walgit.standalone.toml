@@ -1,0 +1,101 @@
+# walgit.standalone.toml — one binary, one bucket, one origin.
+#
+#   walgit-server --config walgit.standalone.toml
+#   → https://walgit.localhost:8080/   (self-signed TLS; PORT=… moves it)
+#
+# Nothing in front of it: TLS, the web UI, the JSON API, smart HTTP (fetch/push),
+# bundle-uri and LFS bytes are all served by this process from the bucket below.
+# An edge that wants to take work over announces it per request with
+# `X-Walgit-Capabilities: …` (`accel-redirect`, honoured only when
+# `server.accel_redirect = true`; see deploy/nginx.conf.example); hit directly,
+# walgit streams every byte itself.
+#
+# Prerequisites on this machine: `git` >= 2.46 (credential `authtype`, bundle URIs) and an
+# S3-compatible or GCS bucket. `just dev-store` starts rustfs in a container for local play.
+# Every key not set here keeps the default documented in walgit.example.toml.
+
+[server]
+listen = "127.0.0.1:8080"                      # PORT env wins; also binds the ::1 twin
+public_url = "https://walgit.localhost:8080"   # browser origin; PORT rewrites the port
+auto_create_on_push = true                     # `git push` to a repository that does not exist yet creates it
+roles = []                                     # empty = every role: serve, maintain (checkpoints, bundles, compaction), events
+
+[server.tls]
+mode = "self_signed"              # generated once under <cache.dir>/tls/, published at /services/public/ca.pem.
+                                  # *.localhost is not a public CA name: the browser warns once (Advanced → proceed);
+                                  # git pins the cert via the installer. Real certificate: mode = "files", cert, key.
+
+[server.auth]
+# Local play: everyone is `anon` with write. Nobody else can reach 127.0.0.1.
+mode = "none"
+#
+# A shared machine — static tokens (bearer or the password of HTTP Basic):
+# mode = "token"
+# anonymous_read = false
+# tokens = [
+#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },
+#   { principal = "ci",    token_env = "WALGIT_TOKEN_CI",    write = false },
+# ]
+#
+# A team — any OpenID Connect issuer (Google, Entra, Okta, Auth0, Keycloak, Dex, GitLab…):
+# browsers sign in through the issuer, then mint git tokens at /_auth/tokens.
+# mode = "oidc"
+# anonymous_read = false
+# issuer = "https://id.example.com"
+# allowed_domains = ["example.com"]              # or allowed_emails = ["you@example.com"]
+# oauth_client_id = "…"                          # redirect URI: <public_url>/_auth/callback
+# oauth_client_secret = "…"                      #   (env: WALGIT__SERVER__AUTH__OAUTH_CLIENT_SECRET)
+# session_secret = "…at least 32 random bytes…"  #   (env: WALGIT__SERVER__AUTH__SESSION_SECRET)
+# audiences = ["walgit-cli"]                     # optional ID-token audiences for non-browser clients
+
+[store]
+# The one durable thing; every host pointed at it serves the same repositories.
+# This shape: rustfs (S3-compatible) in a container, started by `just dev-store` (compose.yaml;
+# bucket walgit-test, keys walgit-dev / walgit-dev-secret). Any S3 (AWS, MinIO, R2, Ceph…) is the
+# same: set endpoint/region, point the key envs at your credentials.
+backend = "s3"
+bucket = "walgit-test"
+prefix = ""
+[store.s3]
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+access_key_env = "AWS_ACCESS_KEY_ID"       # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
+secret_key_env = "AWS_SECRET_ACCESS_KEY"
+force_path_style = true
+# A GCS bucket instead (Application Default Credentials):
+# backend = "gcs"
+# bucket = "my-walgit-bucket"
+# prefix = ""
+
+# Bundles (docs/BUNDLE_URI_DESIGN.md): one weekly full, then **chained** incrementals — each daily on the
+# previous daily (the first on the weekly), each hourly on the previous hourly (restarting from every new
+# daily). The list carries 1 weekly + <= 7 dailies + <= 24 hourlies, every one exactly its delta; git's
+# creationToken heuristic downloads them newest-first until one whose prerequisites it has, so a catch-up
+# is exactly the slots missed. walgit.example.toml has the other shape (every incremental on its base).
+[[bundles.strategy]]
+name = "weekly"
+kind = "full"
+schedule = "0 0 23 * * Sun"
+keep = 1
+backfill_max = 1
+
+[[bundles.strategy]]
+name = "daily"
+kind = "incremental"
+base = "weekly"
+schedule = "0 0 23 * * *"
+chain = true
+
+[[bundles.strategy]]
+name = "hourly"
+kind = "incremental"
+base = "daily"
+schedule = "0 0 * * * *"
+chain = true
+
+[cache]
+dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else
+max_bytes = "20GiB"
+
+[telemetry]
+log_format = "pretty"

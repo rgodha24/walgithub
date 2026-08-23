@@ -1,0 +1,4 @@
+# Patches preserve upstream indentation and mail trailers verbatim.
+docs/patches/*.patch -whitespace
+# The verbatim source article uses Markdown's two-space hard line breaks.
+docs/reference/*.md whitespace=-blank-at-eol

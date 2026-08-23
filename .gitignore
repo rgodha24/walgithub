@@ -1,0 +1,19 @@
+target/
+*.orig
+
+# local secrets / environment — never in the repo
+.env
+.env.*
+*.senv
+.senv
+.dev/
+.pi/
+
+# built web assets (embedded into the binary at build time; `just web-build`)
+web/dist/
+web/node_modules/
+node_modules/
+
+# nix build outputs
+result
+result-*

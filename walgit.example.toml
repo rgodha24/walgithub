@@ -1,0 +1,282 @@
+# walgit.toml — every configuration key, with its default and a comment.
+#
+# Start from walgit.standalone.toml for a first run; come here when you need a key.
+# Normative bundle-slot semantics: docs/BUNDLE_URI_DESIGN.md §4.
+# Every key can also be set from the environment: WALGIT__SECTION__KEY=value (TOML value syntax).
+# Validate with: walgit config check walgit.toml
+
+[server]
+listen = "0.0.0.0:8080"          # PORT env overrides the port
+http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
+max_concurrent_requests = 512     # global cap on in-flight git requests
+max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
+request_timeout = "1h"
+drain_timeout = "20s"             # after SIGTERM, phase 2: how long in-flight requests may finish once /readyz is 503
+                                  # and new fetch/push/LFS are refused (503 + Retry-After). The running maintenance unit
+                                  # is interrupted at once in phase 1 while serving continues.
+max_push_bytes = "64GiB"          # largest accepted push
+# Roles this instance performs: "serve" (git, API, UI, bundles, LFS), "maintain" (checkpoints,
+# bundles, compaction, fsck/repair — implies compact + bundle), "events" (the webhook bridge).
+# Empty = all of them: the one-box shape.
+roles = []
+auto_create_on_push = false       # create a repo on first push if missing
+accel_redirect = false            # behind an nginx edge that announces `X-Walgit-Capabilities: accel-redirect`
+                                  # (deploy/nginx.conf.example): answer bundle/LFS byte requests with X-Accel-Redirect
+                                  # so the edge streams + caches the bytes from the bucket itself. Never on a host
+                                  # clients reach directly (the answer carries a store credential).
+# public_url = "https://git.example.com"   # pins absolute URIs (bundle-uri, LFS, clone recipes, OAuth callback) behind a proxy
+# Browser origins allowed to call /{owner}/{repo}/api-browser/* cross-origin with credentials (the
+# repos.js browser lane from another site). Exact origins or one leading `*.`; empty = no
+# cross-origin lane (no CORS headers).
+# cors_origins = ["https://docs.example.com"]
+
+[server.tls]                      # walgit can terminate TLS itself; behind a proxy leave it "off"
+mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (generated once under <cache.dir>/tls/, served at
+                                  # /services/public/ca.pem, pinned for git by install.sh) | "files" (cert + key below)
+# cert = "/etc/walgit/cert.pem"   # files mode: PEM chain
+# key = "/etc/walgit/key.pem"     # files mode: PKCS#8/PKCS#1 key
+# hostnames = ["git.example.com"] # self_signed SANs; empty = localhost, *.localhost, 127.0.0.1, ::1 + public_url's host
+
+[server.auth]
+mode = "none"                     # "none" | "token" | "oidc"
+                                  #   none  — everyone is `anon` with write (loopback experiments)
+                                  #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
+                                  #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
+                                  #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
+anonymous_read = true             # must be false in oidc mode
+# tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
+#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },
+#   { principal = "ci", token = "literal-secret", write = false },
+# ]
+# issuer = "https://id.example.com"        # oidc: discovery at <issuer>/.well-known/openid-configuration
+# allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
+# allowed_emails = []                      # oidc: individual identities admitted
+# write_domains = ["example.com"]          # oidc: omit to let every admitted identity write
+# oauth_client_id = ""                     # oidc: the client for browser sign-in; redirect URI <public_url>/_auth/callback
+# oauth_client_secret = ""                 #       (set both or neither; use WALGIT__SERVER__AUTH__OAUTH_CLIENT_SECRET)
+# session_secret = ""                      # oidc: HMAC key (>= 32 bytes) for the session cookie and issued tokens; shared by
+#                                          #       every host; rotating it signs everyone out and revokes every issued token
+# session_ttl = "30d"                      # sliding: re-issued on use once older than ttl/4
+# access_token_ttl = "90d"                 # lifetime of tokens minted at /_auth/tokens
+# audiences = []                           # oidc: `aud` values accepted on bearer ID tokens clients mint themselves;
+#                                          #       the configured web client is always accepted
+# trusted_forwarders = []                  # principals allowed to set X-Walgit-Principal (a front in front of a push broker)
+
+[store]
+backend = "s3"                    # "s3" (AWS, MinIO, rustfs, R2, Ceph, …) | "gcs" | "memory" (tests)
+bucket = "walgit"
+prefix = ""                       # global key prefix inside the bucket
+max_retries = 8                   # retries on retryable store errors (jittered backoff)
+multipart_threshold = "64MiB"     # PUTs above this use multipart/resumable uploads
+multipart_part_size = "32MiB"
+
+[store.s3]
+endpoint = "https://s3.us-east-1.amazonaws.com"   # or http://127.0.0.1:9000 for rustfs/MinIO
+region = "us-east-1"
+access_key_env = "AWS_ACCESS_KEY_ID"     # env var names read at runtime; unset = the SDK's default credential chain
+secret_key_env = "AWS_SECRET_ACCESS_KEY"
+force_path_style = false          # true for most self-hosted S3 implementations
+
+[store.gcs]
+endpoint = "https://storage.googleapis.com"  # gRPC endpoint; credentials = Application Default Credentials
+direct_connectivity = true
+# signing_service_account = "sa@project.iam.gserviceaccount.com"   # for bundles/lfs serve_via = "signed_url"
+bulk_clients = 4                  # separate data channels for pack/idx/side-file/bundle/LFS bytes + ranged reads
+bulk_concurrency = 32             # max concurrent bulk requests per process (control plane never queues behind them)
+
+[cache]
+dir = "/tmp/walgit"               # local materialized repos (+ tls/ for a self-signed certificate)
+mode = "auto"                     # "budget" (max_bytes caps disk; too-large repos are served remotely) | "disk" (no budget,
+                                  # full materialization, watermark eviction — a host with a real SSD) | "auto" = disk when
+                                  # maintenance.disk = "ssd"
+max_bytes = "20GiB"               # budget mode only
+disk_high_watermark = 0.9         # disk mode: evict idle repos when the filesystem holding `dir` is fuller than this (0 = never)
+evict_idle_after = "6h"
+prewarm = []                      # "owner/name" repos to materialize at startup
+prewarm_parallelism = 2
+prewarm_ready_timeout = "0s"      # >0: /readyz answers 503 until prewarm finished (or this long)
+ref_advert_entries = 256          # max rendered ref advertisement cache entries
+object_info_entries = 4096        # max object info (size/has) cache entries
+bundle_list_entries = 128         # max bundle list render cache entries
+remote_block_bytes = "1GiB"       # pack-data block LRU for repos too large to materialize (range reads)
+remote_object_bytes = "256MiB"    # decoded-object LRU for the remote reader
+shared_render_cache = true        # mirror rendered sha-addressed API JSON into the store (all instances share)
+# store_mount = "/mnt/store"      # optional read-only mount of the bucket (gcsfuse, s3fs, mountpoint-s3): Serve-level
+                                  # syncs link tier-2 base packs from it (side-files local) instead of copying them to disk
+
+[wal]
+batch_window = "5ms"              # coalesce concurrent publishes into one CAS
+max_batch = 64                    # max pushes per batched index update
+# push_broker_url = ""            # forward receive-pack to a single-writer broker host (empty = publish locally)
+# push_broker_token = ""          # static token this host presents to the broker (or WALGIT_BROKER_TOKEN); the broker
+                                  # lists it in server.auth.tokens and its principal in trusted_forwarders
+push_broker_buffer_bytes = "64MiB" # largest receive-pack body kept replayable for broker → local fallback
+snapshot_every_entries = 256      # checkpoint (ref snapshot + pack inventory, log folded) every N entries …
+checkpoint_interval = "1h"        # … or when the last checkpoint is this old (0 = off) …
+checkpoint_tail_bytes = "8MiB"    # … or when the log tail after it exceeds this (0 = off); refs-level work
+cas_max_retries = 16              # CAS retry cap on PreconditionFailed
+fsck_objects = true               # verify pushed objects before publish
+check_connectivity = true         # require ref tips connected to existing objects
+freshness_ttl = "0s"              # 0 = always revalidate manifest.pb
+prefetch_packs = true             # after a refs-only sync, download packs in the background …
+prefetch_max_bytes = "1GiB"       # … only when the serving copy puts at most this on disk; bigger sets wait for a request that needs objects (0 = no bound)
+remote_objects = true             # pack set > cache.max_bytes: read objects from the store by range (web API)
+
+[maintenance]                     # the `maintain` role: a priority loop, one bounded unit per assigned repo per pass
+interval = "60s"                  # pause between passes
+checkpoints = true                # unit 1: checkpoint repos whose wal.* trigger fired (refs-level)
+max_pack_bytes = "0B"             # declared capacity for units needing a local copy (0 = cache.max_bytes); above it: plan state "wrong-host"
+disk = "tmpfs"                    # "tmpfs" (memory-backed disk) | "ssd" (a real disk: may rebuild bases)
+# host = "maintainer-1"           # heartbeat object maintain/<host>.pb (default: instance id) — the plan shows who maintains a repo
+fsck_interval = "7d"              # lowest-priority unit: git fsck --connectivity-only over a complete local copy → repos/<o>/<r>/fsck.pb
+                                  # (missing objects → walgit_repo_missing_objects{repo} + the `repair` unit from upstream.git); 0 = off
+follow_interval = "30s"           # upstream-follow loop (its own loop next to the priority loop): fetch each assigned repo's
+                                  # `upstream.follow` refs from upstream.git and publish the delta as a push; 0 = off on this host
+
+# Which repositories this host attends to — by rule, not by capacity. Globs "owner/name" | "owner/*" | "*",
+# each list minus its exclude list. One box: leave the defaults. Several: e.g. the big repository on the host
+# with the SSD (serve = maintain = ["acme/monorepo"]) and everything else on the small ones (serve_exclude).
+[placement]
+serve = ["*"]                     # object work here: git-upload-pack, git-receive-pack, LFS transfer, pack prefetch/prewarm …
+serve_exclude = []                # … except these: 503 + Retry-After before any sync; refs-level reads (info/refs,
+                                  # ls-refs, API via the remote reader, UI, bundle list) stay available everywhere
+maintain = ["*"]                  # maintainer units here (with roles ∋ maintain): checkpoints, bundles, compaction, fsck/repair …
+maintain_exclude = []             # … except these
+
+[compaction]
+enabled = true
+factor = 2                        # geometric repack factor
+trigger_packs = 16                # compact when this many tier-0 packs exist
+trigger_bytes = "1GiB"            # or when tier-0 pack bytes exceed this (either way: at least 2 fresh packs; the base/history
+                                  # pack are never folded; a base is rebuilt only by the weekly unit / `walgit compact --base`)
+lease_ttl = "10m"                 # compaction lease TTL
+retention_superseded = "7d"       # keep old packs for provenance / rewind
+engine = "git"                    # "git" (gix cannot delta-compress)
+
+# ---------------------------------------------------------------------------
+# bundle-uri strategies (docs/BUNDLE_URI_DESIGN.md §3-§4 is the design of record)
+#
+#   * `schedule` is a 6-field cron expression in UTC ("sec min hour dom mon dow"; "@weekly" /
+#     "@daily" / "@hourly" are aliases for the defaults below). Each fire time is a SLOT: the
+#     bundle's content is main (or `refs`) AS OF that instant — resolved from the WAL (highest
+#     seq with created_at <= slot) — and `creationToken` = the slot's epoch seconds. Slots are
+#     deterministic: a bundle for Tuesday 23:00 built on Thursday contains Tuesday's main.
+#   * Missing slots are BACKFILLED oldest-first on every maintainer pass (up to `backfill_max`
+#     per pass, 0 = unlimited), so an outage leaves no holes in the chain.
+#   * `kind = "full"` has no prerequisites; git downloads every listed bundle newer than the newest
+#     full on a clone and never walks past it. `kind = "incremental"` requires `base`: its
+#     prerequisites are the tips of the newest `base` bundle whose slot <= this slot.
+#   * Retention: `keep` on a full strategy = fulls listed; an incremental strategy without `chain`
+#     lists its 2 newest whose base is kept (the second keeps a client that read the list a slot
+#     ago from a 404 — git never retries a bundle download).
+#   * `chain = true` on an incremental: a slot is cut on this strategy's own previous bundle while
+#     that is newer than the newest base bundle (dailies chain from the weekly; hourlies restart
+#     from each daily); every slot since the base is listed and kept, each exactly its delta:
+#     more downloads, no overlapping bytes, a catch-up is exactly the slots missed.
+#   * Refs: `bundles.main_only = true` -> HEAD + refs/heads/main (+ `bundles.extra_refs` globs);
+#     false -> refs/heads/*, refs/tags/*, HEAD. A strategy's own `refs = [...]` overrides.
+#   * Full bundles of repos whose pack set does not fit an instance are a bucket-side compose of
+#     the tier-2 base pack (GCS: native; S3: multipart UploadPartCopy); incrementals are built
+#     from the local small packs. Every build is a task (…/tasks) and is narrated.
+#   * Two lists per repository: bundles/list (fulls + chain, for clones) and bundles/catchup (the
+#     chain without fulls, what clone recipes record in fetch.bundleURI).
+# ---------------------------------------------------------------------------
+[[bundles.strategy]]
+name = "weekly"
+kind = "full"
+schedule = "0 0 23 * * Sun"       # Sunday 23:00 UTC (= "@weekly")
+keep = 2                          # fulls listed
+backfill_max = 1                  # at most one missed weekly per pass
+# refs = ["HEAD", "refs/heads/main", "refs/tags/v*"]   # override the default ref set for this strategy
+# min_commits = 25                # override bundles.min_commits for this strategy (incrementals only)
+
+[[bundles.strategy]]
+name = "daily"
+kind = "incremental"
+base = "weekly"
+schedule = "0 0 23 * * *"         # every day 23:00 UTC (= "@daily")
+backfill_max = 0
+chain = true                      # each daily on the previous one (the first on the weekly): <= 7 listed, a catch-up
+                                  # downloads exactly the days missed
+
+[[bundles.strategy]]
+name = "hourly"
+kind = "incremental"
+base = "daily"
+schedule = "0 0 * * * *"          # every hour :00 UTC (= "@hourly")
+backfill_max = 48
+# chain = false                   # hourlies stay on the newest daily, 2 newest listed: a fresh clone is
+                                  # 1 weekly + <= 7 dailies + 2 hourlies, an hourly catch-up <= 2 bundles
+
+# The blobless family for `git clone --filter=blob:none` (design §6b): a chain of its own, same slots,
+# advertised ONLY at bundles/list?filter=blob:none (clients pass --bundle-uri=<that URL>). The full
+# one composes the history pack (commits + trees, no blobs); incrementals pack --filter=blob:none.
+# [[bundles.strategy]]
+# name = "weekly-history"
+# kind = "full"
+# schedule = "0 0 23 * * Sun"
+# keep = 2
+# backfill_max = 1
+# filter = "blob:none"             # only "blob:none"; every strategy of a chain shares the filter
+# [[bundles.strategy]]
+# name = "daily-history"
+# kind = "incremental"
+# base = "weekly-history"
+# schedule = "0 0 23 * * *"
+# filter = "blob:none"
+
+[bundles]
+min_commits = 25                  # don't cut an incremental slot with fewer commits since its base (plan: too-small; fulls never gated)
+min_bytes = "0B"                  # optional second guard on the incremental's pack size (0 = off)
+main_only = true                  # default bundle refs: HEAD + refs/heads/main (false: heads/* + tags/* + HEAD)
+extra_refs = []                   # e.g. ["refs/tags/v*"] added to every bundle's default ref set
+serve_via = "proxy"               # "proxy" (bytes through walgit or the edge) | "signed_url" (presigned bucket URLs in the list)
+signed_url_ttl = "1h"
+advertise = true                  # advertise bundle-uri in v2 capabilities
+advertise_filtered = false        # filtered families in the PLAIN list/advertisement too (filter = lines) — only for
+                                  # clients whose git matches bundle.<id>.filter (docs/patches); stock git would
+                                  # swallow blobless bundles into a full clone (design §6b)
+require = []                      # repos ("owner/name" | "owner/*") whose unbounded zero-have clones must use
+                                  # bundle-uri; shallow/filtered zero-have requests and fetches with haves proceed
+signed_url_for = []               # repos whose bundle URIs are presigned store URLs (clone bytes bypass the hosts); on any
+                                  # signing error the listing falls back to proxy URIs and warns once per repo
+
+[lfs]
+enabled = true
+serve_via = "proxy"               # "proxy" | "signed_url"
+signed_url_ttl = "1h"
+max_object_bytes = "16GiB"
+
+# Where a repository's history lives when it is not (all) here. Usually a per-repo setting
+# (`walgit repo settings set owner/name` → `[upstream] …`); one token for both services.
+[upstream]
+# git = "https://github.com/acme/monorepo.git"           # source for the maintainer's `repair` unit (objects fsck found missing; wants by SHA)
+# lfs = "https://github.com/acme/monorepo.git/info/lfs"  # read-through for LFS objects we lack (batch upload → "present", download/GET → stream + persist)
+# token_env = "WALGIT_UPSTREAM_TOKEN"                     # env var on the maintaining host holding the token; Basic x-access-token:<token>
+# follow = ["refs/heads/main"]                            # refs kept equal to upstream's by the maintaining host: fetched every
+                                                          # maintenance.follow_interval, published through the WAL as a push; fast-forward only
+
+[git]
+binary = "git"                    # path to upstream git binary (>= 2.47 recommended: pack.writeReverseIndex, bundle-uri)
+upload_pack_engine = "auto"       # "auto" = stock git when packs are local/mount-linked, gix only for remote-served bases | "git" | "gix"
+allow_filter = true               # uploadpack.allowFilter
+allow_any_sha1_in_want = false    # uploadpack.allowAnySHA1InWant
+object_format = "sha1"            # default for new repos: "sha1" | "sha256"
+commit_graph = true               # maintain a split commit-graph chain per repo (tier-2 layer from the WAL + incremental)
+history_pack = true               # base rebuild also publishes commits+trees as a local "history pack"
+commit_graph_changed_paths = false # Bloom filters for incremental layers (diffs against parent trees = base pack reads)
+max_wants = 0                     # refuse a fetch wanting more objects than this (0 = off): a blobless clone without
+                                  # --sparse/--no-checkout lazily fetches every blob of HEAD at once; the ERR names the fix
+
+[telemetry]
+log_format = "pretty"             # "json" | "pretty"
+log_filter = "info,walgit=debug"  # EnvFilter; overridden by RUST_LOG
+metrics = true                    # Prometheus on /metrics
+# trace_project = ""              # GCP project for trace-id correlation in JSON logs (optional)
+lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, request_id) when a request waits longer than this on
+                                  # rw/sync_mutex/pack_mutex/bulk permits; histogram walgit_lock_wait_seconds{lock}
+
+[events]                          # docs/EVENTS.md — read only by the bridge (roles ∋ "events"); never gates a push
+# webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
+# webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
+# sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off

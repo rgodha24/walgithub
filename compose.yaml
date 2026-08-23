@@ -1,0 +1,50 @@
+# compose file for walgit local dev (podman compose): rustfs (S3-compatible) + bucket creation.
+#
+# Usage:
+#   podman compose up -d rustfs           # start rustfs
+#   podman compose run --rm create-bucket # create the walgit-test bucket
+#   just dev-store                        # convenience wrapper
+#
+# rustfs exposes the S3 API on :9000 and the console on :9001.
+# Credentials are fixed for local dev — do not use in production.
+
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: walgit-dev
+      RUSTFS_SECRET_KEY: walgit-dev-secret
+      RUSTFS_ADDRESS: "0.0.0.0:9000"
+      RUSTFS_CONSOLE_ADDRESS: "0.0.0.0:9001"
+      RUSTFS_VOLUMES: /data
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the walgit-test bucket after rustfs is healthy.
+  create-bucket:
+    image: amazon/aws-cli:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: walgit-dev
+      AWS_SECRET_ACCESS_KEY: walgit-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: []
+    command: >
+      sh -c "
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://walgit-test 2>/dev/null || true &&
+        aws --endpoint-url http://rustfs:9000 s3 ls
+      "
+    restart: "no"
+
+volumes:
+  rustfs-data:

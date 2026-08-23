@@ -1,0 +1,34 @@
+[package]
+name = "walgit-bundle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+walgit-proto.workspace = true
+walgit-store.workspace = true
+walgit-config.workspace = true
+walgit-git.workspace = true
+walgit-wal = { workspace = true, optional = true }
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+metrics.workspace = true
+cron.workspace = true
+chrono.workspace = true
+hex.workspace = true
+sha1.workspace = true
+async-trait.workspace = true
+prost.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[features]
+default = []
+wal = ["dep:walgit-wal"]
