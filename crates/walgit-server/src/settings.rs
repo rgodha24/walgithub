@@ -77,7 +77,9 @@ pub async fn http_effective(
     h.sync_refs()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let text = toml::to_string_pretty(&*h.effective_config())
+    let text = h
+        .effective_config()
+        .public_settings_toml()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok((
         StatusCode::OK,
@@ -131,7 +133,7 @@ pub async fn http_put(
     query: &str,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     let h = open(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     if bytes.len() > walgit_config::SETTINGS_MAX_BYTES {
@@ -153,7 +155,7 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     let h = open(st, route).await?;
     publish(&h, "", &principal.name, "clear").await
 }
@@ -294,6 +296,9 @@ fn describe_json(
         let host_map: std::collections::HashMap<String, toml::Value> =
             host_flat.into_iter().collect();
         for (k, v) in eff_flat {
+            if k.ends_with("token_env") {
+                continue;
+            }
             // Array-of-tables (strategies) count as set when the document has the array.
             let top = k.split('.').take(2).collect::<Vec<_>>().join(".");
             let is_set = set_keys.contains(&k)

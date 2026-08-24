@@ -77,8 +77,17 @@ pub mod keys {
     pub fn lease_key(name: &str) -> String {
         format!("{LEASES_DIR}{name}.pb")
     }
+    /// Git LFS oid: 64 hex characters (sha256).
+    pub fn lfs_oid_ok(oid: &str) -> bool {
+        oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
     pub fn lfs_key(oid: &str) -> String {
-        format!("{LFS_DIR}{}/{}/{oid}", &oid[0..2], &oid[2..4])
+        let (aa, bb) = match (oid.get(..2), oid.get(2..4)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => ("", ""),
+        };
+        format!("{LFS_DIR}{aa}/{bb}/{oid}")
     }
 }
 
@@ -171,6 +180,10 @@ mod tests {
             "checkpoints/0000000000000001/checkpoint.pb"
         );
         assert_eq!(keys::lfs_key("abcdef"), "lfs/objects/ab/cd/abcdef");
+        assert!(!keys::lfs_oid_ok("ab"));
+        assert!(!keys::lfs_oid_ok("abcdef"));
+        assert!(keys::lfs_oid_ok(&"a".repeat(64)));
+        assert_eq!(keys::lfs_key("ab"), "lfs/objects///ab");
     }
     #[test]
     fn frames_roundtrip_and_partial() {

@@ -198,6 +198,7 @@ fn parse_command_line(b: &[u8]) -> Result<(walgit_proto::v1::RefUpdate, String),
         new_symbolic_target: String::new(),
         new_peeled: String::new(),
     };
+    crate::validate_ref_update(&update)?;
     Ok((update, String::from_utf8_lossy(caps_bytes).to_string()))
 }
 

@@ -279,15 +279,25 @@ impl RepoHandle {
         match self.begin_task("remote-index", HashMap::new()) {
             Begin::Started(task) => {
                 let reporter = task.reporter();
-                let res = RemotePacks::open(
-                    self.store.clone(),
-                    manifest,
-                    self.local.path(),
-                    self.local.object_format().kind(),
-                    self.blocks.clone(),
-                    self.cfg.cache.remote_object_bytes.as_u64(),
-                    &reporter,
-                )
+                let store = self.store.clone();
+                let manifest = manifest.clone();
+                let path = self.local.path().to_path_buf();
+                let hash = self.local.object_format().kind();
+                let blocks = self.blocks.clone();
+                let object_cache_bytes = self.cfg.cache.remote_object_bytes.as_u64();
+                let reporter_bulk = reporter.clone();
+                let res = crate::sync::on_bulk_runtime(async move {
+                    RemotePacks::open(
+                        store,
+                        &manifest,
+                        &path,
+                        hash,
+                        blocks,
+                        object_cache_bytes,
+                        &reporter_bulk,
+                    )
+                    .await
+                })
                 .instrument(task.span())
                 .await;
                 match res {

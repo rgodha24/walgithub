@@ -55,6 +55,8 @@ fn unix_now() -> Option<u64> {
 pub struct Principal {
     pub name: String,
     pub write: bool,
+    /// PUT/DELETE settings and `policy.json`. Independent of `write` (push).
+    pub admin: bool,
     pub anonymous: bool,
 }
 
@@ -63,6 +65,7 @@ impl Principal {
         Self {
             name: "anonymous".to_string(),
             write: false,
+            admin: false,
             anonymous: true,
         }
     }
@@ -361,6 +364,8 @@ pub struct Authenticator {
     allowed_domains: Vec<String>,
     allowed_emails: Vec<String>,
     trusted_forwarders: Vec<String>,
+    admin_emails: Vec<String>,
+    admin_domains: Vec<String>,
     /// Accepted `aud` of bearer ID tokens (`audiences` ∪ `oauth_client_id`).
     audiences: Vec<String>,
     write_domains: Option<Vec<String>>,
@@ -421,6 +426,16 @@ impl Authenticator {
                 .collect(),
             trusted_forwarders: auth
                 .trusted_forwarders
+                .iter()
+                .map(|v| v.to_ascii_lowercase())
+                .collect(),
+            admin_emails: auth
+                .admin_emails
+                .iter()
+                .map(|v| v.to_ascii_lowercase())
+                .collect(),
+            admin_domains: auth
+                .admin_domains
                 .iter()
                 .map(|v| v.to_ascii_lowercase())
                 .collect(),
@@ -625,6 +640,7 @@ impl Authenticator {
             return Ok(Principal {
                 name: forwarded.to_string(),
                 write: caller.write,
+                admin: self.is_admin(forwarded),
                 anonymous: false,
             });
         }
@@ -637,6 +653,7 @@ impl Authenticator {
             return Some(Ok(Principal {
                 name: st.principal.clone(),
                 write: st.write,
+                admin: st.admin,
                 anonymous: false,
             }));
         }
@@ -654,6 +671,7 @@ impl Authenticator {
             AuthMode::None => Ok(Principal {
                 name: "anon".to_string(),
                 write: true,
+                admin: true,
                 anonymous: false,
             }),
             AuthMode::Token => {
@@ -685,7 +703,7 @@ impl Authenticator {
         }
     }
 
-    /// Require a principal with `write` for write/admin operations.
+    /// Require a principal with `write` for git push / LFS upload / repo create.
     pub async fn require_write(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         let p = self.authenticate(headers).await?;
         if p.write {
@@ -693,6 +711,34 @@ impl Authenticator {
         } else {
             Err(AuthError::Forbidden)
         }
+    }
+
+    /// Require a principal that may mutate settings and `policy.json`.
+    pub async fn require_admin(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
+        let p = self.authenticate(headers).await?;
+        if p.admin {
+            Ok(p)
+        } else {
+            Err(AuthError::Forbidden)
+        }
+    }
+
+    fn is_admin(&self, name: &str) -> bool {
+        if self.mode == AuthMode::None {
+            return true;
+        }
+        let lower = name.to_ascii_lowercase();
+        if self.admin_emails.iter().any(|e| e == &lower) {
+            return true;
+        }
+        if let Some((_, domain)) = lower.rsplit_once('@')
+            && self.admin_domains.iter().any(|d| d == domain)
+        {
+            return true;
+        }
+        self.tokens
+            .iter()
+            .any(|t| t.admin && t.principal.eq_ignore_ascii_case(name))
     }
 
     /// Require read access: anonymous read only when `anonymous_read` allows it.
@@ -770,8 +816,9 @@ impl Authenticator {
             Some(domains) => domains.iter().any(|d| d == &domain_lower),
         };
         Ok(Principal {
-            name: email,
+            name: email.clone(),
             write,
+            admin: self.is_admin(&email),
             anonymous: false,
         })
     }
@@ -933,6 +980,7 @@ fn resolve_tokens(tokens: &[StaticToken]) -> Vec<StaticToken> {
                 token,
                 token_env: None,
                 write: t.write,
+                admin: t.admin,
             }
         })
         .filter(|t| !t.token.is_empty())
@@ -1093,6 +1141,7 @@ GcZ0izY/30012ajdHY+/QK5lsMoxTnn0skdS+spLxaS5ZEO4qvPVb8RAoCkWMMal
             token: token.into(),
             token_env: None,
             write,
+            admin: false,
         }
     }
 

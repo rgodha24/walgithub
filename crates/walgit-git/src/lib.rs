@@ -62,7 +62,80 @@ fn ge<E: std::error::Error + Send + Sync + 'static>(e: E) -> GitError {
     GitError::Gix(Box::new(e))
 }
 
+/// Reject ref names that would inject `git update-ref --stdin` commands or
+/// poison packed-refs (newlines, NULs, git-illegal bytes).
+pub fn validate_ref_name(name: &str) -> Result<(), GitError> {
+    if name == "HEAD" {
+        return Ok(());
+    }
+    let bad = name.is_empty()
+        || !name.starts_with("refs/")
+        || name.bytes().any(|b| {
+            matches!(
+                b,
+                0 | b'\n' | b'\r' | b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'
+            )
+        })
+        || name.contains("..")
+        || name.contains("@{")
+        || name.contains("//")
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.ends_with(".lock");
+    if bad {
+        Err(GitError::InvalidInput(format!("invalid ref name {name:?}")))
+    } else {
+        Ok(())
+    }
+}
+
+/// Full hex oid (sha1 40 or sha256 64). Empty / all-zeros is a delete/create marker.
+pub fn validate_oid(oid: &str) -> Result<(), GitError> {
+    if oid.is_empty() || oid.bytes().all(|b| b == b'0') {
+        return Ok(());
+    }
+    let n = oid.len();
+    if (n == 40 || n == 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(GitError::InvalidInput(format!("invalid oid {oid:?}")))
+    }
+}
+
+pub fn validate_ref_update(u: &walgit_proto::v1::RefUpdate) -> Result<(), GitError> {
+    if !u.new_symbolic_target.is_empty() {
+        if u.name != "HEAD" {
+            return Err(GitError::InvalidInput(format!(
+                "symbolic update is only allowed for HEAD, got {:?}",
+                u.name
+            )));
+        }
+        return validate_ref_name(&u.new_symbolic_target);
+    }
+    validate_ref_name(&u.name)?;
+    validate_oid(&u.old_oid)?;
+    validate_oid(&u.new_oid)
+}
+
 const WALGIT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod validate_ref_tests {
+    use super::*;
+
+    #[test]
+    fn ref_names_reject_injection() {
+        assert!(validate_ref_name("HEAD").is_ok());
+        assert!(validate_ref_name("refs/heads/main").is_ok());
+        assert!(validate_ref_name("refs/heads/foo\nupdate refs/heads/main").is_err());
+        assert!(validate_ref_name("refs/heads/foo\0bar").is_err());
+        assert!(validate_ref_name("../etc/passwd").is_err());
+        assert!(validate_oid(&"0".repeat(40)).is_ok());
+        assert!(validate_oid("gg").is_err());
+        assert!(validate_oid(&"a".repeat(40)).is_ok());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RepoId
@@ -613,6 +686,15 @@ impl LocalRepo {
         gix::Repository::from(&*tsr)
     }
 
+    /// Re-open so gix sees new packed-refs / HEAD without remapping pack indexes.
+    /// Ref-only writers use this; pack installs use [`refresh`].
+    pub fn refresh_refs(&self) -> Result<(), GitError> {
+        self.refs_changed();
+        let tsr = gix::ThreadSafeRepository::open(&self.inner.path).map_err(ge)?;
+        *self.inner.tsr.lock() = tsr;
+        Ok(())
+    }
+
     /// Re-open the underlying repository so the odb/refs reflect on-disk
     /// changes from pack/ref writes.
     pub fn refresh(&self) -> Result<(), GitError> {
@@ -1071,6 +1153,10 @@ impl LocalRepo {
                 .cloned()
         };
 
+        for u in &txn.updates {
+            validate_ref_update(u)?;
+        }
+
         // Pre-check old values for clear error reporting.
         if check_old {
             let view = self.ref_view()?;
@@ -1179,15 +1265,15 @@ impl LocalRepo {
 
         // Apply symbolic ref updates by writing the HEAD file directly.
         for u in &symref_updates {
-            let head_path = self.inner.path.join(&u.name);
+            let head_path = self.inner.path.join("HEAD");
             std::fs::write(&head_path, format!("ref: {}\n", u.new_symbolic_target))
                 .map_err(GitError::Io)?;
         }
         // Patch the snapshot we started from instead of throwing it away: re-parsing
         // packed-refs + peeling 100 k tags was the O(refs) term every push handed to the next
-        // request (~700 ms debug / ~200 ms release at 500 k refs, AGENTS §1.4). `refresh()`
-        // bumps the generation; the patched data is installed under the new key.
-        self.refresh()?;
+        // request (~700 ms debug / ~200 ms release at 500 k refs, AGENTS §1.4). `refresh_refs()`
+        // bumps the generation without remapping pack indexes.
+        self.refresh_refs()?;
         self.refs_changed();
         if let Some(mut c) = before {
             c.pending.push(txn.clone());
@@ -1292,7 +1378,7 @@ impl LocalRepo {
             std::fs::write(path.join("HEAD"), format!("ref: {}\n", snap.head_target))
                 .map_err(GitError::Io)?;
         }
-        self.refresh()?;
+        self.refresh_refs()?;
         Ok(())
     }
 
@@ -1323,6 +1409,7 @@ impl LocalRepo {
         let repo = self.gix();
         for txn in txns {
             for u in &txn.updates {
+                validate_ref_update(u)?;
                 if !u.new_symbolic_target.is_empty() {
                     if u.name == "HEAD" {
                         head_target = u.new_symbolic_target.clone();
@@ -1364,7 +1451,7 @@ impl LocalRepo {
 
     pub fn pack_refs(&self) -> Result<(), GitError> {
         self.git_cmd_sync(&["pack-refs", "--all", "--prune"])?;
-        self.refresh()?;
+        self.refresh_refs()?;
         Ok(())
     }
 

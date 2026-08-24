@@ -62,7 +62,9 @@ pub struct ServerConfig {
     /// `X-Accel-Redirect: /_store/` + `X-Walgit-Store-Url` (and `-Authorization`) and no
     /// body, so nginx streams (and caches) the bytes itself. Only turn it on behind an
     /// edge that strips the capability header from clients: the answer carries a store
-    /// credential. Off by default.
+    /// credential. Off by default. Even when on, accel is honoured only for loopback
+    /// peers (the example nginx talks to `127.0.0.1`) so a client on a public bind
+    /// cannot spoof the capability header and steal the store credential.
     pub accel_redirect: bool,
     /// Browser origins allowed to call `/api/*` cross-origin with credentials
     /// (the `repos.js` browser lane from other sites). Exact origins or one
@@ -159,6 +161,12 @@ pub struct AuthConfig {
     /// server — the host that fronts a push broker. Names as they authenticate here (a static
     /// token's `principal`, or an email).
     pub trusted_forwarders: Vec<String>,
+    /// OIDC emails that may PUT/DELETE settings and `policy.json`. Empty = none via email.
+    #[serde(default)]
+    pub admin_emails: Vec<String>,
+    /// OIDC email domains that may PUT/DELETE settings and `policy.json`. Empty = none via domain.
+    #[serde(default)]
+    pub admin_domains: Vec<String>,
     /// HMAC key for the browser session cookie and for walgit-issued access tokens
     /// (`oidc` mode). Unset = cookie sessions and issued tokens off. When set, must be ≥ 32
     /// bytes; shared by every host that answers a browser.
@@ -185,7 +193,8 @@ pub const ACCESS_TOKEN_PREFIX: &str = "wgt_";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
-    /// Everyone is `anon` with write. Loopback experiments only.
+    /// Everyone is `anon` with write **and admin**. `Config::validate` refuses this
+    /// unless `server.listen` is loopback.
     #[default]
     None,
     /// Static tokens from the config (`tokens`), bearer or basic.
@@ -205,6 +214,9 @@ pub struct StaticToken {
     pub token_env: Option<String>,
     #[serde(default = "default_true")]
     pub write: bool,
+    /// Mutate per-repo settings and `policy.json`. Default false: write is push, not admin.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,6 +829,12 @@ impl Config {
                 SETTINGS_SECTIONS.join(", ")
             );
         }
+        if let Some(toml::Value::Table(u)) = overrides.get("upstream") {
+            anyhow::ensure!(
+                !u.contains_key("token_env"),
+                "settings: upstream.token_env is host-only (it names an env var on the maintaining host)"
+            );
+        }
         let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
         fn merge(into: &mut toml::Table, from: &toml::Table) {
             for (k, v) in from {
@@ -833,6 +851,17 @@ impl Config {
         cfg.validate()
             .context("settings: validating the effective config")?;
         Ok(cfg)
+    }
+
+    /// The effective config a reader may see: only [`SETTINGS_SECTIONS`], and
+    /// never `upstream.token_env` (that name is host-only).
+    pub fn public_settings_toml(&self) -> Result<String> {
+        let mut doc: toml::Table = toml::Table::try_from(self).context("serializing config")?;
+        doc.retain(|k, _| SETTINGS_SECTIONS.iter().any(|s| *s == k));
+        if let Some(toml::Value::Table(u)) = doc.get_mut("upstream") {
+            u.remove("token_env");
+        }
+        toml::to_string_pretty(&doc).context("encoding settings")
     }
 
     /// D25: the effective on-disk budget — `cache.max_bytes` in budget mode,
@@ -1002,7 +1031,7 @@ impl Default for Config {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
-            listen: "0.0.0.0:8080".parse().unwrap(),
+            listen: "127.0.0.1:8080".parse().unwrap(),
             http2: true,
             max_concurrent_requests: 512,
             max_concurrent_per_repo: 64,
@@ -1031,6 +1060,8 @@ impl Default for AuthConfig {
             audiences: vec![],
             write_domains: None,
             trusted_forwarders: vec![],
+            admin_emails: vec![],
+            admin_domains: vec![],
             session_secret: None,
             session_ttl: Duration::from_secs(30 * 24 * 3600),
             access_token_ttl: Duration::from_secs(90 * 24 * 3600),
@@ -1437,6 +1468,13 @@ impl Config {
         }
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
+        if a.mode == AuthMode::None {
+            anyhow::ensure!(
+                self.server.listen.ip().is_loopback(),
+                "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
+                self.server.listen
+            );
+        }
         if a.mode == AuthMode::Token {
             anyhow::ensure!(
                 !a.tokens.is_empty(),
@@ -1868,6 +1906,16 @@ listen = \"0.0.0.0:1\"\n",
             base.with_settings("  ").unwrap().bundles.min_commits,
             base.bundles.min_commits
         );
+        let e = base
+            .with_settings("[upstream]\ntoken_env = \"AWS_SECRET_ACCESS_KEY\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("token_env"), "{e}");
+        let pub_toml = base.public_settings_toml().unwrap();
+        assert!(pub_toml.contains("[bundles]"), "{pub_toml}");
+        assert!(!pub_toml.contains("session_secret"), "{pub_toml}");
+        assert!(!pub_toml.contains("[server]"), "{pub_toml}");
+        assert!(!pub_toml.contains("token_env"), "{pub_toml}");
     }
 
     #[test]
@@ -1901,6 +1949,11 @@ audiences = ["walgit-cli", "https://git.example.com"]
             ok.server.auth.access_token_ttl,
             Duration::from_secs(90 * 86400)
         );
+        let err = Config::parse(
+            "[store]\nbucket = \"b\"\n[server]\nlisten = \"0.0.0.0:8080\"\n[server.auth]\nmode = \"none\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("loopback-only"), "{err}");
     }
 
     #[test]

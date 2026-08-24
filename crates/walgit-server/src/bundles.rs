@@ -113,6 +113,7 @@ pub async fn object(
     route: &RepoRoute,
     method: &Method,
     headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
 ) -> Result<Response, ApiError> {
     let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;
@@ -137,6 +138,7 @@ pub async fn object(
         static_object::ServeOptions {
             content_type: "application/x-git-bundle",
             accel: st.cfg.server.accel_redirect,
+            peer,
             ..Default::default()
         },
     )

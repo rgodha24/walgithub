@@ -34,10 +34,12 @@ pub mod tls;
 pub mod web;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::extract::ConnectInfo;
 use axum::http::{Method, Request};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -305,12 +307,19 @@ async fn dispatch(
     let query = req.uri().query().unwrap_or("").to_string();
     let method = req.method().clone();
     let headers = req.headers().clone();
+    let peer = request_peer(&req);
     let body = req.into_body();
 
     let Some(route) = parse_repo_route(&path) else {
         return ApiError::NotFound("no such route".into()).into_response();
     };
-    dispatch_route(&st, &route, method, headers, query, body).await
+    dispatch_route(&st, &route, method, headers, query, body, peer).await
+}
+
+pub(crate) fn request_peer(req: &Request<Body>) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0)
 }
 
 /// Route a parsed repo request (`/{owner}/{repo}[.git]/<sub>` or the same sub
@@ -323,6 +332,7 @@ pub(crate) async fn dispatch_route(
     headers: axum::http::HeaderMap,
     query: String,
     body: Body,
+    peer: Option<SocketAddr>,
 ) -> Response {
     let mut body = Some(body);
     let sub = route.subpath.as_str();
@@ -347,7 +357,7 @@ pub(crate) async fn dispatch_route(
             (&Method::GET | &Method::HEAD, s)
                 if s.starts_with("info/lfs/objects/") && !s.ends_with("/batch") =>
             {
-                lfs::get_object(st, route, &method, &headers, &query).await
+                lfs::get_object(st, route, &method, &headers, &query, peer).await
             }
             (&Method::PUT, s) if s.starts_with("info/lfs/objects/") => {
                 lfs::put_object(st, route, &headers, body.take().unwrap()).await
@@ -365,7 +375,7 @@ pub(crate) async fn dispatch_route(
             (&Method::GET | &Method::HEAD, s)
                 if s.starts_with("bundles/") && s != "bundles/list" && s != "bundles/catchup" =>
             {
-                bundles::object(st, route, &method, &headers).await
+                bundles::object(st, route, &method, &headers, peer).await
             }
             (&Method::PUT, "") => admin::create(st, route, &headers, &query).await,
             (&Method::DELETE, "") => admin::delete(st, route, &headers).await,
@@ -570,9 +580,12 @@ pub async fn serve(
                 .await
             }
             None => {
-                axum::serve(NodelayListener(listener), app)
-                    .with_graceful_shutdown(graceful)
-                    .await
+                axum::serve(
+                    NodelayListener(listener),
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(graceful)
+                .await
             }
         }
     };

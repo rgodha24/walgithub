@@ -160,6 +160,10 @@ pub struct ServeOptions<'a> {
     /// has an object URL, answer `200` + `X-Accel-Redirect` (no body) and let the
     /// edge move the bytes. `false`: always stream from here.
     pub accel: bool,
+    /// TCP peer. Accel is honoured only when this is loopback (nginx on the
+    /// same host). A client on a public bind cannot spoof the capability
+    /// header and steal `X-Walgit-Store-Authorization`.
+    pub peer: Option<std::net::SocketAddr>,
 }
 
 impl Default for ServeOptions<'_> {
@@ -169,6 +173,7 @@ impl Default for ServeOptions<'_> {
             cache_control: None,
             filename: None,
             accel: false,
+            peer: None,
         }
     }
 }
@@ -238,7 +243,11 @@ pub async fn serve(
     // nginx fetches the object with its own credentials, slices Range itself and
     // caches the bytes on its disk, so a 32 GB bundle never ties up a worker on
     // this instance. HEAD stays local (metadata only, nothing to offload).
-    if opts.accel && !head && accel_requested(headers) {
+    if opts.accel
+        && !head
+        && accel_requested(headers)
+        && opts.peer.is_some_and(|p| p.ip().is_loopback())
+    {
         if let Some(target) = store.accel_target(key).await {
             let meta = match store.head(key).await {
                 Ok(Some(m)) => m,
