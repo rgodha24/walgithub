@@ -1,5 +1,13 @@
 # walgit justfile — local dev and test targets.
 
+# `timeout` is GNU coreutils: absent on macOS, where every wrapped recipe otherwise dies with
+# `sh: timeout: command not found` (exit 127) before a single test runs — pushing contributors
+# onto the broad `cargo test --workspace` that AGENTS.md forbids. Prefer timeout, then gtimeout
+# (brew install coreutils), else run unwrapped: no watchdog is better than no tests.
+t5 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 300"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 300"; else echo ""; fi`
+t10 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 600"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 600"; else echo ""; fi`
+t15 := `if command -v timeout >/dev/null 2>&1; then echo "timeout 900"; elif command -v gtimeout >/dev/null 2>&1; then echo "gtimeout 900"; else echo ""; fi`
+
 # Default: show available targets.
 default:
     @just --list
@@ -73,13 +81,13 @@ dev-store-stop:
 # Never run `cargo test --workspace --no-fail-fast` interactively: a single
 # hung test blocks for the whole timeout. Use `just e2e` / `just ci` below.
 test:
-    timeout 300 cargo test --workspace --lib --bins
-    timeout 300 cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
-    timeout 300 cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
+    {{t5}} cargo test --workspace --lib --bins
+    {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
+    {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain
 
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
-    timeout 600 cargo test -p walgit-server --test e2e {{ARGS}}
+    {{t10}} cargo test -p walgit-server --test e2e {{ARGS}}
 
 # Zero rustc warnings, workspace-wide, all targets (tests, benches, examples).
 # Done by grepping the normal build instead of RUSTFLAGS=-D warnings, which would
@@ -87,7 +95,13 @@ e2e *ARGS:
 warnings:
     #!/usr/bin/env bash
     set -uo pipefail
-    out="$(timeout 900 cargo build --workspace --all-targets 2>&1)"
+    # A command substitution that fails does NOT abort under `set -uo pipefail` (no -e), so a
+    # workspace that does not compile used to fall through to "no rustc warnings" and exit 0 —
+    # the preflight passing on a broken tree. Check the build's status before grepping it.
+    if ! out="$({{t15}} cargo build --workspace --all-targets 2>&1)"; then
+        printf '%s\n' "$out"
+        echo; echo "cargo build failed — fix the errors above"; exit 1
+    fi
     if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
         printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
