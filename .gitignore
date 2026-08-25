@@ -9,6 +9,9 @@ target/
 .dev/
 .pi/
 
+# local review dumps (findings, smoketests, notes — not for the repo)
+.review/
+
 # built web assets (embedded into the binary at build time; `just web-build`)
 web/dist/
 web/node_modules/

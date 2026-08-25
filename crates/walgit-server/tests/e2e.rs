@@ -1539,12 +1539,14 @@ async fn bundles_require_allows_one_upload_pack_fallback_after_a_failed_bundle_a
                 token: "dev".into(),
                 token_env: None,
                 write: true,
+                admin: false,
             },
             walgit_config::StaticToken {
                 principal: "other@example.com".into(),
                 token: "other".into(),
                 token_env: None,
                 write: true,
+                admin: false,
             },
         ];
     })
@@ -2136,6 +2138,8 @@ async fn repo_settings_api_roundtrip() -> TestResult {
     assert!(r["toml"].as_str().unwrap().contains("min_commits = 2"));
     let eff = c.get(url(&a, "/effective")).send().await?.text().await?;
     assert!(eff.contains("min_commits = 2"), "{eff}");
+    assert!(!eff.contains("session_secret"), "{eff}");
+    assert!(!eff.contains("[server]"), "{eff}");
 
     // The sibling sees it (refs-level sync, no objects).
     let r: serde_json::Value = c.get(url(&b, "")).send().await?.json().await?;
@@ -2676,6 +2680,7 @@ async fn public_lane_serves_only_the_installer_without_auth() -> TestResult {
             token: "dev".into(),
             token_env: None,
             write: true,
+            admin: false,
         }];
     })
     .await?;
@@ -2735,6 +2740,7 @@ async fn stale_cached_credential_is_erased_by_the_401_and_replaced_on_the_next_c
             token: "fresh".into(),
             token_env: None,
             write: true,
+            admin: false,
         }];
     })
     .await?;

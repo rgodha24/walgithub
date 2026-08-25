@@ -270,9 +270,11 @@ host's config (`effective config`).
 `GET` → `{revision, author, updated_at, message, toml}` (`revision: 0` = none). `PUT` body = the TOML
 (`?message=` optional), validated against the serving host's build — 400 with the reason and nothing published
 on failure; 200 `{revision}`. `DELETE` publishes an empty document. `GET …/settings/effective` → the effective
-config as TOML (`application/toml`); `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,
-at,toml}]}` from the live log (older changes are folded into checkpoints). All `no-store`; write needs write
-access. Every instance sees a new revision on its next refs-level sync (no extra round trip: the document rides
+`[bundles]`/`[maintenance]`/`[compaction]`/`[upstream]` as TOML (`application/toml`; no host secrets,
+no `token_env`); `GET …/settings/history` → `{min_seq, entries:[{seq,revision,author,message,
+at,toml}]}` from the live log (older changes are folded into checkpoints). All `no-store`; PUT/DELETE need
+**admin** (`tokens[].admin` or oidc `admin_emails`/`admin_domains`; `mode = none` is admin on loopback).
+Every instance sees a new revision on its next refs-level sync (no extra round trip: the document rides
 inline on `manifest.pb`). CLI: `walgit repo settings show|set|clear|history`.
 
 Settings tab helpers (`/{o}/{r}/api/settings…`, all `no-store`): `GET …/settings/describe` → `{settings, sections,

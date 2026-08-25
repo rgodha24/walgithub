@@ -75,7 +75,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
   client: SSE envelope for the web UI, sideband band-2 lines for git. "Cloning into… and then nothing" is a bug.
 
 ### 1.3 Security contract (`Config::validate` fails closed)
-- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write — loopback only),
+- Three auth modes (`server.auth.mode`): **`none`** (everyone is `anon` with write and admin — `validate` refuses unless `server.listen` is loopback),
   **`token`** (static tokens from the config, as `Authorization: Bearer` or an HTTP Basic password), **`oidc`**
   (any OpenID Connect issuer via discovery). In `oidc` mode `anonymous_read` must be false and an allowlist
   (`allowed_domains`/`allowed_emails`) must exist; three credentials are accepted — an ID token from the issuer
@@ -93,7 +93,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 - **An edge announces what it took over, per request, in `X-Walgit-Capabilities`** (D39): `client-authorization`
   (the client's bearer travels in `X-Walgit-Authorization`; `Authorization` is the hop's own credential and is
   never read as the client's) and `accel-redirect` (static bytes by `X-Accel-Redirect`, honoured only when
-  `server.accel_redirect = true`). Hit directly, nothing is assumed.
+  `server.accel_redirect = true` **and the TCP peer is loopback**). Hit directly, nothing is assumed.
 - **The installer** (`crates/walgit-server/src/setup.rs`, POSIX sh, idempotent): git ≥ 2.46 + curl; pins a
   self-signed host's CA; takes the token from `$WALGIT_TOKEN`, an already stored one, or the terminal (no terminal:
   exit 2 with the two things to do); writes `~/.config/git/<host>-token` (0600) and the credential helper
@@ -342,7 +342,10 @@ decision in §4 — or the PR is; never "fix later".
   as a `SETTINGS` log entry **and inline on `manifest.pb`** (every refs-level sync sees the effective config at no
   extra round trip). Effective config = host `walgit.toml` ⊕ env ⊕ settings (`Config::with_settings`). Validated at
   publish; invalid = 400, nothing published. Surface: `GET|PUT|DELETE /{o}/{r}/api/settings`, `…/effective`,
-  `…/history`; `walgit repo settings show|set|clear|history`. Not in settings: auth, store, server, wal, cache.
+  `…/history`; `walgit repo settings show|set|clear|history`. Not in settings: auth, store, server, wal, cache,
+  `upstream.token_env` (host-only). `GET …/effective` returns only those sections. PUT/DELETE of settings and of
+  `policy.json` require an **admin** principal (`tokens[].admin`, or oidc `admin_emails`/`admin_domains`;
+  `mode = none` is admin on loopback). Write is push, not admin.
 - **D25** **Two cache modes.** `cache.mode = "budget" | "disk" | "auto"` (auto = disk when `maintenance.disk =
   "ssd"`); in **disk** mode `cache_budget_bytes()` is 0 = unlimited — every repo fully local, never the
   too-large/remote/link path, eviction only under disk pressure (`cache.disk_high_watermark`, idle-oldest first).

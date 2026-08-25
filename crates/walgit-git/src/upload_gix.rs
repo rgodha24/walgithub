@@ -274,7 +274,7 @@ impl LocalRepo {
                         oid: missing[0].to_hex().to_string(),
                     });
                 }
-                self.refresh()?;
+                self.refresh_async().await?;
             }
         }
 
@@ -323,7 +323,7 @@ impl LocalRepo {
                             oid: missing[0].to_hex().to_string(),
                         });
                     }
-                    self.refresh()?;
+                    self.refresh_async().await?;
                 }
             }
         };
@@ -368,7 +368,7 @@ impl LocalRepo {
                         oid: missing[0].to_hex().to_string(),
                     });
                 }
-                self.refresh()?;
+                self.refresh_async().await?;
             }
         }
 

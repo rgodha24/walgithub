@@ -90,6 +90,9 @@ pub async fn batch(
     let cfg = handle.effective_config();
 
     let is_upload = body.operation == "upload";
+    for o in &body.objects {
+        require_lfs_oid(&o.oid)?;
+    }
     // Local presence first; then one bounded upstream batch for the misses.
     let mut local = Vec::with_capacity(body.objects.len());
     let mut missing = Vec::new();
@@ -214,6 +217,7 @@ pub async fn get_object(
     method: &axum::http::Method,
     headers: &HeaderMap,
     query: &str,
+    peer: Option<std::net::SocketAddr>,
 ) -> Result<Response, ApiError> {
     if !st.cfg.lfs.enabled {
         return Err(ApiError::NotFound("lfs disabled".into()));
@@ -221,6 +225,7 @@ pub async fn get_object(
     let _ = st.auth.require_read(headers).await.map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
+    require_lfs_oid(oid)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(oid);
@@ -242,6 +247,7 @@ pub async fn get_object(
         headers,
         crate::static_object::ServeOptions {
             accel: st.cfg.server.accel_redirect,
+            peer,
             ..Default::default()
         },
     )
@@ -387,26 +393,53 @@ pub async fn put_object(
     let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
     not_served_here(st, &route.id)?;
     let oid = route_sub_last(&route.subpath)?;
+    require_lfs_oid(oid)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
     let key = keys::lfs_key(oid);
+    let max = st.cfg.lfs.max_object_bytes.as_u64();
 
+    let tmp = tempfile::NamedTempFile::new().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut file = tokio::fs::File::from_std(
+        tmp.reopen()
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
+    );
     let mut reader = body_to_async_read(body);
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut hasher = Sha256::new();
+    let mut n = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let k = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if k == 0 {
+            break;
+        }
+        n += k as u64;
+        if n > max {
+            return Err(ApiError::PayloadTooLarge);
+        }
+        hasher.update(&buf[..k]);
+        file.write_all(&buf[..k])
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    file.flush()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    if (buf.len() as u64) > st.cfg.lfs.max_object_bytes.as_u64() {
-        return Err(ApiError::PayloadTooLarge);
-    }
-    let hash = sha256_hex(&buf);
-    if hash != oid {
+    drop(file);
+    if hex::encode(hasher.finalize()) != oid {
         return Err(ApiError::BadRequest("lfs object sha256 mismatch".into()));
     }
     store
-        .put(&key, PutBody::from(buf), PutMode::Overwrite.into())
+        .put(
+            &key,
+            PutBody::File(tmp.path().to_path_buf()),
+            PutMode::Overwrite.into(),
+        )
         .await
         .map_err(store_err)?;
     Ok(StatusCode::OK.into_response())
@@ -424,6 +457,7 @@ pub async fn verify(
     }
     let body: BatchObject = serde_json::from_slice(&body_bytes)
         .map_err(|e| ApiError::BadRequest(format!("invalid lfs verify: {e}")))?;
+    require_lfs_oid(&body.oid)?;
     let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
     let handle = open_repo(st, &route.id, false).await?;
     let store = handle.store().clone();
@@ -450,11 +484,12 @@ fn not_served_here(st: &AppState, id: &walgit_git::RepoId) -> Result<(), ApiErro
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(data);
-    hex::encode(h.finalize())
+fn require_lfs_oid(oid: &str) -> Result<(), ApiError> {
+    if keys::lfs_oid_ok(oid) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest("invalid lfs oid".into()))
+    }
 }
 
 fn route_sub_last(subpath: &str) -> Result<&str, ApiError> {

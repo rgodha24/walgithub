@@ -679,7 +679,7 @@ pub async fn http_put(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
     ensure_repo(st, route).await?;
     let bytes = crate::collect_body(body).await?;
     let policy = parse_bytes(&bytes).map_err(store_err)?;
@@ -694,7 +694,7 @@ pub async fn http_delete(
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _ = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _ = st.auth.require_admin(headers).await.map_err(auth_err)?;
     ensure_repo(st, route).await?;
     clear(&st.store, &route.id).await.map_err(store_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())

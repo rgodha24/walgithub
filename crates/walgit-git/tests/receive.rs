@@ -60,6 +60,18 @@ async fn parse_receive_pack_commands_and_push_options() {
 }
 
 #[tokio::test]
+async fn parse_receive_rejects_newline_in_ref_name() {
+    let zero = "0".repeat(40);
+    let new = "a".repeat(40);
+    let mut body = Vec::new();
+    let line = format!("{zero} {new} refs/heads/foo\nupdate refs/heads/main {new}");
+    encode_data(&mut body, line.as_bytes());
+    encode_flush(&mut body);
+    let err = receive::parse(&body[..]).await.unwrap_err().to_string();
+    assert!(err.contains("invalid ref name"), "{err}");
+}
+
+#[tokio::test]
 async fn parse_receive_no_commands() {
     let mut body = Vec::new();
     encode_flush(&mut body);

@@ -6,7 +6,7 @@
 # Validate with: walgit config check walgit.toml
 
 [server]
-listen = "0.0.0.0:8080"          # PORT env overrides the port
+listen = "127.0.0.1:8080"        # default; `mode = none` is refused unless this is loopback. Public bind: 0.0.0.0 with token/oidc.
 http2 = true                      # HTTP/2 (h2c when TLS is off, ALPN when on)
 max_concurrent_requests = 512     # global cap on in-flight git requests
 max_concurrent_per_repo = 64      # per-repo cap (upload-pack / receive-pack)
@@ -39,15 +39,17 @@ mode = "off"                      # "off" (HTTP/1.1 + h2c) | "self_signed" (gene
 
 [server.auth]
 mode = "none"                     # "none" | "token" | "oidc"
-                                  #   none  — everyone is `anon` with write (loopback experiments)
+                                  #   none  — everyone is `anon` with write+admin; loopback listen only
                                   #   token — static `tokens` below, as `Authorization: Bearer` or the password of HTTP Basic
                                   #   oidc  — any OpenID Connect issuer: browser sign-in through it, ID tokens as bearers,
                                   #           walgit-issued access tokens for git (/_auth/tokens), plus `tokens` for robots
 anonymous_read = true             # must be false in oidc mode
 # tokens = [                      # token → principal; `token_env` reads the value from the environment at startup
-#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true },
+#   { principal = "alice", token_env = "WALGIT_TOKEN_ALICE", write = true, admin = true },
 #   { principal = "ci", token = "literal-secret", write = false },
 # ]
+# admin_emails = []                # oidc: emails that may PUT/DELETE settings and policy.json
+# admin_domains = []               # oidc: email domains that may PUT/DELETE settings and policy.json
 # issuer = "https://id.example.com"        # oidc: discovery at <issuer>/.well-known/openid-configuration
 # allowed_domains = ["example.com"]        # oidc: email domains admitted (email_verified required)
 # allowed_emails = []                      # oidc: individual identities admitted

@@ -408,7 +408,8 @@ async fn repo_admin(
     let query = req.uri().query().unwrap_or("").to_string();
     let method = req.method().clone();
     let headers = req.headers().clone();
-    crate::dispatch_route(&st, &route, method, headers, query, req.into_body()).await
+    let peer = crate::request_peer(&req);
+    crate::dispatch_route(&st, &route, method, headers, query, req.into_body(), peer).await
 }
 
 #[cfg(test)]
