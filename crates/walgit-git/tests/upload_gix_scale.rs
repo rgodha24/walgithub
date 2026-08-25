@@ -31,7 +31,14 @@ mod cm {
 fn max_rss_kb() -> u64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    ru.ru_maxrss as u64
+    // getrusage reports ru_maxrss in KB on Linux but in BYTES on macOS/BSD.
+    // Without this, the memory-bound assertion reads 1024x high on macOS and
+    // fails a passing result (a 16 MB delta shown as "16832 MB").
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let kb = (ru.ru_maxrss as u64) / 1024;
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let kb = ru.ru_maxrss as u64;
+    kb
 }
 
 /// Deterministic source via `git fast-import`: `commits` commits, each rewriting `files_per_commit`
