@@ -1,0 +1,82 @@
+name: CI
+
+# The repository had no build/test workflow: only pages.yml (a site deploy). A workspace that did
+# not compile reached main because nothing ran cargo on push. This runs `just ci` — the same three
+# tiers AGENTS.md documents (warnings, test, e2e) — so CI and a contributor's laptop cannot drift.
+# The tier definitions live in the justfile, never duplicated here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: warnings + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # prost-build does not vendor protoc; without it the proto crate fails with NotFound.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # No toolchain version here on purpose: rust-toolchain.toml pins it (and its components).
+      # `rustup show` installs exactly that, so the pin has one home.
+      - name: Install the pinned Rust toolchain
+        run: rustup show && cargo --version && git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      # Required, not cosmetic: build.rs only writes a placeholder index.html, and api_v1's
+      # v1_surface_and_browser_lane asserts /repos.js and /repos.mjs are served 200. Also runs
+      # oxlint --deny-warnings and tsc --noEmit, so the web gate is covered here too.
+      - name: Build the SPA and the SDK
+        run: just web-build
+
+      - run: just warnings
+      - run: just test
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install the pinned Rust toolchain
+        run: rustup show && cargo --version && git --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build the SPA and the SDK
+        run: just web-build
+      - run: just e2e

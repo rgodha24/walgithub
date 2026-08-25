@@ -483,9 +483,8 @@ fn loopback_twin(addr: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
     }
 }
 
-/// TCP listener that enables low-latency writes on every accepted connection.
-/// Git's receive-pack status consists of many pkt-lines; leaving Nagle enabled
-/// can turn those writes into tens of seconds of delayed-ACK stalls.
+/// axum `Listener` over [`TcpAccept`] (the dual-stack loopback binder). Nagle
+/// is disabled per-connection via `.tap_io(set_nodelay)` at the serve site.
 struct NodelayListener(TcpAccept);
 
 impl axum::serve::Listener for NodelayListener {
@@ -495,12 +494,7 @@ impl axum::serve::Listener for NodelayListener {
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
             match self.0.accept().await {
-                Ok((stream, addr)) => {
-                    if let Err(e) = stream.set_nodelay(true) {
-                        tracing::debug!(error = ?e, %addr, "failed to set TCP_NODELAY");
-                    }
-                    return (stream, addr);
-                }
+                Ok((stream, addr)) => return (stream, addr),
                 Err(e) => {
                     tracing::warn!(error = ?e, "TCP accept failed");
                 }
@@ -510,6 +504,17 @@ impl axum::serve::Listener for NodelayListener {
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
         self.0.local_addr()
+    }
+}
+
+/// Enable TCP_NODELAY on an accepted stream. Applied via `Listener::tap_io` so
+/// the connection stays a plain `TcpStream` and axum's blanket `Connected` impl
+/// for `TapIo` supplies the peer `SocketAddr` to `ConnectInfo` (used by the
+/// accel-redirect loopback check). Git's receive-pack status is many small
+/// pkt-lines; leaving Nagle on turns those into delayed-ACK stalls.
+fn set_nodelay(stream: &mut tokio::net::TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = ?e, "failed to set TCP_NODELAY");
     }
 }
 
@@ -580,8 +585,9 @@ pub async fn serve(
                 .await
             }
             None => {
+                use axum::serve::ListenerExt;
                 axum::serve(
-                    NodelayListener(listener),
+                    NodelayListener(listener).tap_io(set_nodelay),
                     app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
                 )
                 .with_graceful_shutdown(graceful)

@@ -67,7 +67,11 @@ async fn parse_receive_rejects_newline_in_ref_name() {
     let line = format!("{zero} {new} refs/heads/foo\nupdate refs/heads/main {new}");
     encode_data(&mut body, line.as_bytes());
     encode_flush(&mut body);
-    let err = receive::parse(&body[..]).await.unwrap_err().to_string();
+    // Not `.unwrap_err()`: the Ok tuple holds a PrefixedReader, which is not Debug.
+    let err = match receive::parse(&body[..]).await {
+        Ok(_) => panic!("expected parse to reject the ref name"),
+        Err(e) => e.to_string(),
+    };
     assert!(err.contains("invalid ref name"), "{err}");
 }
 
