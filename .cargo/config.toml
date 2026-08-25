@@ -1,2 +1,32 @@
 [build]
 target-dir = "target"
+
+# Hermetic git for everything cargo spawns.
+#
+# Tests across walgit-bundle, walgit-cli, walgit-git and walgit-wal run `git init` / `git commit`
+# in temp repos without sandboxing git config, so they inherit the developer's. A contributor with
+# commit.gpgsign set gets "gpg failed to sign the data: No secret key" on ~30 tests — green on a
+# bare CI runner, red on a signing laptop, which is the worse way round: CI cannot see it.
+#
+# GIT_CONFIG_GLOBAL does not disable a setting, it replaces the path git reads global config from.
+# Pointed at /dev/null, ~/.gitconfig is never opened, so its include.path chain is never followed
+# either — which is where a signing flag often hides, several files deep. Nulling the config also
+# drops user.name and user.email, hence the fixed identity below. tests/lib-auth.sh already does
+# this for the shell suite.
+#
+# Scope is deliberately wider than tests: [env] covers every process cargo launches, so
+# `cargo run -p walgit-server` also gets a neutered global config. That is wanted — a server
+# spawning index-pack and repack should not inherit a laptop's hooks, aliases, gc.auto or
+# fsmonitor — but it is not "tests only". The scoped alternative is .env() on each git-spawning
+# helper across four crates: no blast radius, ~40 lines of duplication, and every new test that
+# spawns git has to remember. One place won.
+#
+# `force` stays at its default (false), so a value already exported still wins. Unix-only
+# (/dev/null); a Windows host would need NUL.
+[env]
+GIT_CONFIG_GLOBAL = "/dev/null"
+GIT_CONFIG_SYSTEM = "/dev/null"
+GIT_AUTHOR_NAME = "walgit tests"
+GIT_AUTHOR_EMAIL = "tests@walgit.test"
+GIT_COMMITTER_NAME = "walgit tests"
+GIT_COMMITTER_EMAIL = "tests@walgit.test"
