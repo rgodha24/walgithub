@@ -1,0 +1,8 @@
+# The panic-path restriction lints in [workspace.lints.clippy] (unwrap_used, panic,
+# indexing_slicing, ...) target production code; tests may panic freely — that is how
+# they fail.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = true

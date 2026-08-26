@@ -1,8 +1,8 @@
 name: CI
 
 # The repository had no build/test workflow: only pages.yml (a site deploy). A workspace that did
-# not compile reached main because nothing ran cargo on push. This runs `just ci` — the same three
-# tiers AGENTS.md documents (warnings, test, e2e) — so CI and a contributor's laptop cannot drift.
+# not compile reached main because nothing ran cargo on push. This runs `just ci` — the same
+# tiers AGENTS.md documents (warnings, clippy, test, e2e) — so CI and a contributor's laptop cannot drift.
 # The tier definitions live in the justfile, never duplicated here.
 
 on:
@@ -54,6 +54,7 @@ jobs:
         run: just web-build
 
       - run: just warnings
+      - run: just clippy
       - run: just test
 
   e2e:

@@ -32,3 +32,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 [features]
 default = []
 wal = ["dep:walgit-wal"]
+
+[lints]
+workspace = true

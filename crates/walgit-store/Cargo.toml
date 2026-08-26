@@ -43,3 +43,6 @@ sha1 = { workspace = true }
 bytesize = { workspace = true }
 uuid = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[lints]
+workspace = true

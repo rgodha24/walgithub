@@ -17,6 +17,49 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.90"
 
+# The lint gate: `just clippy` runs `cargo clippy --workspace --all-targets -- -D warnings`
+# against this table (every crate opts in with `[lints] workspace = true`). Test code is
+# exempt from the panic-path restriction lints via clippy.toml (allow-unwrap-in-tests etc.).
+[workspace.lints.rust]
+# The two statvfs call sites must carry an explicit #[allow(unsafe_code)] — new unsafe
+# should be a reviewed decision, not a habit.
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# Panic paths in production code. A panic here is a 500 (CatchPanicLayer) at best and an
+# aborted push at worst; recoverable failures must travel as Results. Known-infallible
+# cases (constant HeaderValue parses, checked-then-unwrap invariants) should say so with
+# a targeted #[allow] or an expect() naming the invariant.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+unchecked_time_subtraction = "warn"
+
+# Debugging leftovers must not reach main.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Unsafe hygiene: every unsafe block carries a // SAFETY: comment and does one thing.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"
+
+# Holding a sync lock across .await stalls the whole worker thread.
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+
+# Pedantic members that are documentation/naming style, not safety — pure noise here.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+
 [workspace.dependencies]
 walgit-proto = { path = "crates/walgit-proto" }
 walgit-store = { path = "crates/walgit-store" }

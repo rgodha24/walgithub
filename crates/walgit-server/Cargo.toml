@@ -68,3 +68,6 @@ tempfile.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }
+
+[lints]
+workspace = true

@@ -12,3 +12,6 @@ serde.workspace = true
 toml.workspace = true
 humantime-serde.workspace = true
 bytesize.workspace = true
+
+[lints]
+workspace = true
