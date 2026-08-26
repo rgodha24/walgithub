@@ -71,7 +71,8 @@ impl S3Store {
     ///
     /// Credentials are read from the env vars named in
     /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
+    /// `AWS_SESSION_TOKEN` when present.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
         let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
             anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
@@ -80,7 +81,11 @@ impl S3Store {
             anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
         })?;
 
-        let creds = Credentials::new(&access_key, &secret_key, None, None, "walgit-static");
+        let creds = static_credentials(
+            &access_key,
+            &secret_key,
+            std::env::var("AWS_SESSION_TOKEN").ok(),
+        );
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
 
         let mut s3_config = aws_sdk_s3::Config::builder()
@@ -890,6 +895,14 @@ impl S3Store {
     }
 }
 
+fn static_credentials(
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<String>,
+) -> Credentials {
+    Credentials::new(access_key, secret_key, session_token, None, "walgit-static")
+}
+
 // ---- rustfs compatibility notes (integration testing) -------------------
 //
 // 1. Presigned URLs: rustfs honors SigV4 presigned GET URLs with conditional
@@ -904,3 +917,26 @@ impl S3Store {
 // 8. ETags: quoted, MD5 for single-PUT, compound for multipart. Quotes
 //    stripped consistently in our Version.
 // 9. force_path_style: required for rustfs local dev.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_credentials_include_session_token_when_present() {
+        let creds = static_credentials("access", "secret", Some("session".into()));
+
+        assert_eq!(creds.access_key_id(), "access");
+        assert_eq!(creds.secret_access_key(), "secret");
+        assert_eq!(creds.session_token(), Some("session"));
+    }
+
+    #[test]
+    fn static_credentials_work_without_session_token() {
+        let creds = static_credentials("access", "secret", None);
+
+        assert_eq!(creds.access_key_id(), "access");
+        assert_eq!(creds.secret_access_key(), "secret");
+        assert_eq!(creds.session_token(), None);
+    }
+}
