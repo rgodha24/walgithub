@@ -94,7 +94,7 @@ export function ApiPage() {
             <Row path="/api/v1/owners/{owner}/repos" desc="Repository names under one owner." cache="SWR" />
             <Row
               path={`/${r}/api`}
-              desc={<>Repo summary: <code>{`{owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}`}</code> (O(1) ref counts). <code>PUT</code> creates, <code>DELETE</code> removes (write).</>}
+              desc={<>Repo summary: <code>{`{owner,name,full_name,head,branches,tags,clone_url,html_url,api_url}`}</code> (O(1) ref counts). <code>PUT</code> creates (write), <code>DELETE</code> removes (admin).</>}
               cache="SWR + ETag"
             />
             <Row path={`…/${r}/refs`} desc={<>Default branch only: <code>{`{head:{name,sha}|null}`}</code>. O(1) whatever the ref count.</>} cache="SWR + ETag" />

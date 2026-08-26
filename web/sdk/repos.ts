@@ -603,7 +603,7 @@ export class RepoClient {
   async create(opts?: CallOptions): Promise<void> {
     await this.client.json<unknown>(this.p, opts, { method: "PUT" });
   }
-  /** Delete the repository (write permission). Irreversible. */
+  /** Delete the repository (admin permission). Irreversible. */
   async delete(opts?: CallOptions): Promise<void> {
     await this.client.json<unknown>(this.p, opts, { method: "DELETE" });
   }

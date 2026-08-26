@@ -55,7 +55,8 @@ fn unix_now() -> Option<u64> {
 pub struct Principal {
     pub name: String,
     pub write: bool,
-    /// PUT/DELETE settings and `policy.json`. Independent of `write` (push).
+    /// Repository deletion and PUT/DELETE settings and `policy.json`.
+    /// Independent of `write` (push and repository creation).
     pub admin: bool,
     pub anonymous: bool,
 }
@@ -713,7 +714,7 @@ impl Authenticator {
         }
     }
 
-    /// Require a principal that may mutate settings and `policy.json`.
+    /// Require a principal that may delete repositories or mutate settings and `policy.json`.
     pub async fn require_admin(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
         let p = self.authenticate(headers).await?;
         if p.admin {
