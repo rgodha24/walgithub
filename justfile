@@ -108,8 +108,14 @@ warnings:
     fi
     echo "no rustc warnings"
 
+# Clippy, workspace-wide, all targets, warnings are errors. The lint set lives in
+# [workspace.lints] in Cargo.toml; test code is exempt from the panic-path restriction
+# lints via clippy.toml (allow-unwrap-in-tests etc.).
+clippy:
+    {{t15}} cargo clippy --workspace --all-targets -- -D warnings
+
 # Everything that must be green before a merge (what CI runs).
-ci: warnings test e2e
+ci: warnings clippy test e2e
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
