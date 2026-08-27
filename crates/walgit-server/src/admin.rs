@@ -39,13 +39,13 @@ pub async fn create(
     }
 }
 
-/// `DELETE /{owner}/{repo}` — delete manifest + all objects under the repo prefix.
+/// `DELETE /{owner}/{repo}` — admin-only deletion of the manifest and every object under the repo prefix.
 pub async fn delete(
     st: &AppState,
     route: &RepoRoute,
     headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
-    let _principal = st.auth.require_write(headers).await.map_err(auth_err)?;
+    let _principal = st.auth.require_admin(headers).await.map_err(auth_err)?;
     st.registry.delete(&route.id).await.map_err(wal_err)?;
     Ok((StatusCode::NO_CONTENT, "").into_response())
 }

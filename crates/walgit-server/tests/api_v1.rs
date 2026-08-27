@@ -456,3 +456,79 @@ async fn d26_prefix_form_matches_v1_alias() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_delete_requires_admin() -> TestResult {
+    let server = Server::start_with_tweak(|c| {
+        c.server.auth.mode = walgit_config::AuthMode::Token;
+        c.server.auth.anonymous_read = false;
+        c.server.auth.tokens = vec![
+            walgit_config::StaticToken {
+                principal: "writer".into(),
+                token: "writer-token".into(),
+                token_env: None,
+                write: true,
+                admin: false,
+            },
+            walgit_config::StaticToken {
+                principal: "admin".into(),
+                token: "admin-token".into(),
+                token_env: None,
+                write: true,
+                admin: true,
+            },
+        ];
+    })
+    .await?;
+
+    let writer = [("Authorization", "Bearer writer-token")];
+    let admin = [("Authorization", "Bearer admin-token")];
+
+    assert_eq!(
+        req(&server, reqwest::Method::PUT, "/secure/delete/api", &writer,)
+            .await?
+            .0,
+        201,
+        "write permission still creates repositories"
+    );
+
+    for path in [
+        "/secure/delete",
+        "/secure/delete/api",
+        "/secure/delete/api-browser",
+    ] {
+        assert_eq!(
+            req(&server, reqwest::Method::DELETE, path, &writer)
+                .await?
+                .0,
+            403,
+            "non-admin deletion through {path}"
+        );
+    }
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/secure/delete/api", &writer,)
+            .await?
+            .0,
+        200,
+        "forbidden deletion must leave the repository intact"
+    );
+
+    assert_eq!(
+        req(
+            &server,
+            reqwest::Method::DELETE,
+            "/secure/delete/api",
+            &admin,
+        )
+        .await?
+        .0,
+        204
+    );
+    assert_eq!(
+        req(&server, reqwest::Method::GET, "/secure/delete/api", &admin,)
+            .await?
+            .0,
+        404
+    );
+    Ok(())
+}
