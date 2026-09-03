@@ -95,10 +95,18 @@ rather than calling `/rate_limit`, though `GET /api/v3/rate_limit` answers too.
 `GET /api/v3/repos/{o}/{r}/collaborators/{u}/permission`, `GET /login/oauth/authorize`,
 `POST /login/oauth/access_token`.
 
-**Reads** — `GET /api/v3/repos/{o}/{r}`, `…/commits`, `…/commits/{ref}` (branch, tag or sha),
-`…/git/commits/{sha}`, `…/branches`, `…/branches/{branch}`, `…/git/ref/{ref}`, `…/git/refs[/{ref}]`,
-`…/git/matching-refs/{ref}`. Listings carry a `Link` header (`next`/`prev`/`first`; no `last`, which would
-mean walking a whole history).
+**Reads** — `GET /api/v3/repos/{o}/{r}`, `…/commits` (`?sha=`, `?path=`), `…/commits/{ref}` (branch, tag
+or sha), `…/git/commits/{sha}`, `…/branches`, `…/branches/{branch}`, `…/git/ref/{ref}`,
+`…/git/refs[/{ref}]`, `…/git/matching-refs/{ref}`. Listings carry a `Link` header
+(`next`/`prev`/`first`; no `last`, which would mean walking a whole history).
+
+**Object reads** — `…/git/trees/{sha}` (`?recursive=`), `…/git/blobs/{sha}`, `…/contents[/{path}]`
+(`?ref=`), `…/compare/{base}...{head}`, `…/readme` (`?ref=`), `…/zipball[/{ref}]`, `…/tarball[/{ref}]`.
+Everything renders through stock `git` on the **bare** serving copy — `ls-tree`, `cat-file`, `diff-tree`
+and `archive` all work without a work tree, so the scratch checkout §8 predicted was never needed.
+
+**Branch protection** — `…/rules/branches/{branch}` and `…/branches/{branch}/protection`, both driven by
+one object per repository in the bucket (below).
 
 **Writes** — `POST /api/v3/repos/{o}/{r}/git/refs`, `PATCH` and `DELETE` on `…/git/refs/{ref}`, all on the
 write primitive below.
@@ -119,9 +127,57 @@ failure names the gap instead of a transport error. The next phase fills in arms
 | `write.rs` | The write primitive. |
 | `error.rs` | `{message, documentation_url}` (+ `errors[]` on a 422) with GitHub's statuses. |
 | `events.rs` | The hook point where a webhook would be produced. |
+| `reads.rs` | Trees, blobs, the README, archives, branch protection — and the git plumbing (`git`, `ls_tree`, `commit_facts`, `parse_commits`, `base64_github`, `wants_raw`, `resolve_ref`) the other read modules share. |
+| `contents.rs` | `contents/{path}` in its four representations, plus `entry_type`/`entry_json`/`file_json`/`file_response`. |
+| `compare.rs` | Three-dot compare. |
+| `diff.rs` | `FileChange` and `changed_files`/`file_json` — `files[]` rendered by `git diff-tree`. |
 
 Later phases slot in beside these: a `prs.rs` (PR state as JSON under the repository's prefix in the
-bucket), a `diff.rs` (compare/merge on a scratch checkout), and dispatch arms inside `router::graphql`.
+bucket) and dispatch arms inside `router::graphql`.
+
+## 6a. The read surface in detail
+
+- **Trees.** `{sha}` is a tree sha, a commit sha *or* a ref name, all peeled with `rev-parse ^{tree}`.
+  `recursive` is any truthy string. `truncated` is always `false` — there is no cap, and every caller
+  reads `true` as either "start a BFS" or "give up". Recursive listings carry repo-relative paths and keep
+  the `tree` entries (`ls-tree -r -t`); non-recursive ones carry bare names.
+- **Blobs and raw media.** Any `Accept` containing `raw` (`application/vnd.github.raw`, `…raw+json`,
+  octokit's `mediaType: {format: "raw"}`) returns the bytes with `Content-Type: application/vnd.github.raw`
+  — the bypass client destroys the stream otherwise. `contents` additionally honours
+  `application/vnd.github.object+json`. JSON `content` is GitHub's base64: a newline every 60 characters
+  and a trailing one.
+- **Contents.** A file is an object, a directory is an **array** — `getFileBufferByPath` branches on
+  `Array.isArray` and `getContentDirectorySha` refuses a non-array. A blob over 1 MiB answers
+  `content: ""`, `encoding: "none"`, which is what drives the client's fallback to `git/blobs/{sha}`.
+  An empty repository, a missing path and a missing `ref` are all 404.
+- **Compare.** Three-dot: `ahead_by`, `behind_by`, `commits[]` and `files[]` are all measured from the
+  merge base, and `merge_base_commit` is a full commit object because its `.sha` is dereferenced with no
+  null guard. `base..head` is accepted as well as `base...head`, and an `owner:branch` side has its owner
+  stripped (there are no forks here). Unrelated histories fall back to `base` as the merge base rather
+  than answering without one. Pagination follows GitHub's caps rather than its `per_page` default:
+  ≤ 250 commits and ≤ 300 files per page, and *no* `per_page` means both caps, because `compareRef`
+  sends no pagination and still expects the whole file list. A binary file carries no `patch`.
+- **Archives.** GitHub 302s to codeload; walgit streams `git archive` on the 200 instead, under the same
+  `<repo>-<shortsha>/` prefix the template extractor strips. Both callers read `response.data` as an
+  `ArrayBuffer` and the tarball caller sets `redirect: "follow"`, so a body on the first response is what
+  they end up with either way — and it saves inventing a second origin that has to be reachable.
+- **Branch protection.** GitHub's rulesets API is an order of magnitude more surface than anything reads,
+  so the facade stores the answer and renders the rule objects from it. The object is
+  `github/protection.json` under the repository's prefix:
+
+  ```json
+  { "protected_branches": ["main"], "required_approving_review_count": 0 }
+  ```
+
+  Set it with `PUT /api/v3/_dev/repos/{o}/{r}/protection` (a CAS on the object's version; the `_dev`
+  prefix is there so no client mistakes it for a GitHub route). A protected branch answers
+  `rules/branches/{b}` with `pull_request`, `non_fast_forward` and `deletion` rules and
+  `branches/{b}/protection` with the legacy object; an unprotected one answers `[]` and a 404 whose
+  message is `Branch not protected`. `branches/{b}` reports `protected` from the same object — a
+  hardcoded `false` there would short-circuit `getBranchProtections` before it ever asked for the rules.
+  `branches/{*branch}` is a catch-all (branch names contain `/`), so `/protection` is dispatched inside
+  that handler rather than by a route of its own; a branch literally named `<x>/protection` is
+  unreachable.
 
 ## 7. The write primitive
 
@@ -161,12 +217,15 @@ Semantics worth knowing:
   `sync_objects()` hands back `ObjectAccess::Remote` — the facade renders through stock `git` against the
   local copy and has no remote-reader path (`web/objects.rs` has one for the web API; wiring it in is a
   later phase). Fine for a developer's repositories, wrong for a monorepo.
-- **No scratch checkout yet.** `git diff` and `git merge` need a worktree, and the serving copy is bare.
-  The compare/merge phase should follow the base-rebuild precedent (`crates/walgit-server/src/rebuild.rs`):
-  a scratch copy under `<cache.dir>/` that never rewrites the serving copy. `write.rs`'s `Scratch` is the
-  smaller version of the same idea and is the place to grow it.
-- **`files` and `stats` are omitted from a commit response.** They are a diff, so they wait for the same
-  phase.
+- **No scratch checkout, and none needed for reads.** `diff-tree`, `ls-tree`, `cat-file` and `archive`
+  all take tree-ishes and never look at a work tree, so the whole read surface runs on the bare serving
+  copy. `git merge` still needs one; when the merge phase arrives it should follow the base-rebuild
+  precedent (`crates/walgit-server/src/rebuild.rs`) — a scratch copy under `<cache.dir>/` that never
+  rewrites the serving copy — with `write.rs`'s `Scratch` as the place to grow it.
+- **`files` and `stats` are still omitted from a commit response.** `compare` has them
+  (`diff::changed_files`); wiring the same call into `commits/{ref}` is a one-liner nobody has needed yet.
+- **An archive is not range-requestable and carries no `Content-Length`.** It is streamed straight off
+  `git archive`, so a client that retries a partial download starts over.
 - **Ref names.** `write::validate_ref_name` accepts `refs/…` only, with no `..`, `//`, space, control byte
   or `~^:?*[\`. The path segments a URL wildcard delivers are already decoded by axum, so a branch with a
   `/` works; a branch with a `%` in it has never been tried.
@@ -179,6 +238,12 @@ Semantics worth knowing:
   reader of the WAL from a durable cursor (`crate::bridge`, `docs/EVENTS.md`), never a step of a write.
 
 ## 9. Testing
+
+`crates/walgit-server/tests/github_reads.rs` covers the read surface: trees in both modes, blobs as JSON
+and as raw bytes, `contents` as a directory / a file / raw / `object+json` / 404, compare (ahead with a
+rename and a binary file, diverged, identical, `owner:branch`), the README in both representations, a
+zipball whose listing is checked with `unzip -l` and a gzip-magic tarball, and the protection toggle
+end to end.
 
 `crates/walgit-server/tests/github.rs` boots a server on the in-memory store, pushes a real repository with
 real `git`, then exercises the auth stubs, the OAuth flow, every read shape, ref create/update/delete, a
