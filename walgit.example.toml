@@ -292,3 +292,14 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
                                   # trust the self-signed cert, so pair it
                                   # with [server.tls] mode = "off".
 enabled = false
+# webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"  # outbound GitHub webhooks: push / create /
+                                  # delete rendered from the WAL by the events bridge, pull_request from the
+                                  # PR handlers. Independent of [events].webhook_url above, which keeps its
+                                  # own walgit-native array format. Leave the roles list empty (every role) or
+                                  # include "events" — the bridge is what produces the ref deliveries.
+# webhook_secret = ""             # x-hub-signature-256: sha256=<HMAC-SHA256 of the raw body>; unset = unsigned,
+                                  # which every GitHub client rejects
+# installation_id = 1             # installation.id in every payload
+# webhook_poll_interval = "1s"    # a dev bucket has no notifications, so the bridge polls this often; a push to
+                                  # this instance wakes it directly, so this only covers other writers. 0 = only
+                                  # [events].sweep_interval

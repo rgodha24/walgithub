@@ -34,6 +34,10 @@ beyond loopback (a compose network, say) — the network the process sits on is 
 ```toml
 [github]
 enabled = true          # default false; docs/GITHUB.md
+# webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"   # §11
+# webhook_secret = "…"
+# installation_id = 1
+# webhook_poll_interval = "1s"
 
 [server]
 listen = "127.0.0.1:8080"
@@ -124,7 +128,8 @@ catch-all and both a branch name and a ref may contain `/`:
 | `merge.rs` | `git merge-tree` merges (merge, squash, rebase), publishing, and `generate`. |
 | `stubs.rs` | Check runs, deployments and statuses (accept-and-forget). |
 | `error.rs` | `{message, documentation_url}` (+ `errors[]` on a 422) with GitHub's statuses. |
-| `events.rs` | The hook point where a webhook would be produced. |
+| `events.rs` | The post-commit hook a facade write calls; it wakes the events bridge and nothing else. |
+| `webhook.rs` | Outbound webhooks (§11): the signed sender, the bridge sink that renders `push`/`create`/`delete` from the WAL, and the `pull_request` deliveries the PR handlers send. |
 | `reads.rs` | Trees, blobs, the README, archives, branch protection, and `ls_tree`/`base64_github`/`wants_raw`/`resolve_ref`. |
 | `contents.rs` | `contents/{path}` in its four representations, plus `entry_type`/`entry_json`/`file_json`/`file_response`. |
 | `compare.rs` | Three-dot compare. |
@@ -230,8 +235,10 @@ Semantics worth knowing:
   different buckets will agree on it.
 - **`created_at` is a constant.** The WAL has no repository creation time; `pushed_at`/`updated_at` come
   from the manifest's `updated_at`, which is real.
-- **The facade produces no events.** `events.rs` is a hook point only. Principle III: a webhook must be a
-  reader of the WAL from a durable cursor (`crate::bridge`, `docs/EVENTS.md`), never a step of a write.
+- **Ref webhooks are produced by the bridge, not by the write.** `push` / `create` / `delete` come out of
+  the WAL through `crate::bridge` from a durable cursor (§11, principle III); `pull_request` is the one
+  exception, because PR state is the facade's own and is not in the WAL — it is best effort from the
+  handler and always spawned, so no request ever waits on a webhook.
 
 Reads:
 
@@ -447,3 +454,80 @@ installation token, REST, GraphQL) against a running facade. Point it at a serve
 directory whose `node_modules` has `octokit` (`ln -s <app>/node_modules`), and it walks 28 steps:
 reads, `createCommitOnBranch` including the stale-head error, compare, a PR opened, reviewed, commented
 on and merged, `commits/{sha}/pulls`, and a check-run created then patched.
+
+## 11. Webhooks
+
+The facade delivers GitHub-shaped webhooks so a GitHub App backend deploys on a `git push` the way it does
+against real GHES. `docs/GITHUB_SHAPES.md` §"Tier 5 — Webhooks" is the contract; this is how it is produced.
+
+### 11.1 Configuration
+
+```toml
+[github]
+enabled = true
+webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"   # unset = no webhooks
+webhook_secret = "a-shared-secret"   # unset = unsigned, which every GitHub client rejects
+installation_id = 1                  # default 1; `installation.id` in every payload
+webhook_poll_interval = "1s"         # default 1s; 0 = fall back to events.sweep_interval
+```
+
+`webhook_url` must be http(s) (`Config::validate`). It is **independent of `[events] webhook_url`**: the
+walgit-native array webhook (`docs/EVENTS.md`) keeps its own shape and its own secret, and both sinks see
+every batch when both are configured.
+
+**Roles.** The producer is the events bridge, which runs under `Role::Events` — and `has_role` answers true
+for every role when `server.roles` is empty, which is the default. So a standalone facade needs **no `roles`
+setting at all**; if you do set the list, `roles = ["serve", "events"]` (or any list containing `events`) is
+the minimum. `walgit.standalone.toml` sets none, so it already runs the bridge.
+
+### 11.2 What is emitted
+
+| Event | From | When |
+|---|---|---|
+| `push` | the WAL, via the bridge | every `refs/heads/*` transition, creates and deletes included |
+| `create` / `delete` | the WAL, via the bridge | a branch or tag appears or disappears |
+| `pull_request` (`opened`, `closed`, `reopened`, `edited`, `ready_for_review`, `converted_to_draft`) | `prs.rs` / `graphql/mutate.rs` | the handler that changed the PR |
+| `pull_request` (`synchronize`) | the WAL, via the bridge | a push moved an open PR's head branch (found by head ref in `github/prs/index.json`) |
+
+`push` carries `ref`, `before`, `after` (forty zeros on a create or a delete), `created`, `deleted`,
+`forced` (`before` is not an ancestor of `after`), `size`, `repository` (the same shape every REST read
+renders), `installation.id`, `pusher`, `sender`, `head_commit` and `commits[]`. A commit's
+`added`/`modified`/`removed` come from `git log -1 --name-status --first-parent --root` on the bare serving
+copy; `size` is the whole range while `commits[]` is capped at **20** (GitHub's cap, and the consumer reads
+`commits.length < size` as "incomplete"). The newest 20 are kept, so `head_commit` is always the last entry
+of `commits[]`. A branch create renders the tip commit only. `sender.login` and every commit's
+`author.username` / `committer.username` are the facade's one user, `mintlify-dev`; `pusher.name` is the
+WAL entry's principal, which is who actually pushed.
+
+`create` / `delete` carry a **bare** `ref` (not `refs/heads/…`), `ref_type`, `master_branch`, `repository`,
+`installation`, `sender` and `pusher_type: "user"`.
+
+Every delivery is one JSON body with `content-type: application/json`, `x-github-event`,
+`x-github-delivery` (uuid v4), `user-agent: GitHub-Hookshot/walgit` and, with a secret configured,
+`x-hub-signature-256: sha256=<hex HMAC-SHA256 of the raw body>` — the same HMAC the walgit-native signature
+uses, under GitHub's header name.
+
+### 11.3 Where they come from, and the latency
+
+**Ref deliveries are readers of the WAL, never steps of a write** (principle III). `github::webhook::GithubSink`
+is a `crate::events::Sink` on the bridge, so a delivery happens iff the entry is durable, a non-2xx or a
+timeout leaves the cursor where it was and the batch is retried, and a down consumer adds **zero**
+milliseconds to receive-pack. Delivery is therefore at-least-once.
+
+Two wake-ups reach it here:
+
+- **A write on this instance wakes it directly.** `smart.rs` (receive-pack) and `github::events::ref_written`
+  (every facade write) call `Bridge::wake`, which spawns a `catch_up`. Measured in
+  `tests/github_webhooks.rs`: a `git push` to a delivered, signed `push` in **~20–25 ms**.
+  This wake exists only when `github.webhook_url` is set — the walgit-native bus keeps exactly the two
+  wake-ups `docs/EVENTS.md` promises, because a production bridge is a separate service and must not depend
+  on sharing a process with a writer.
+- **The sweep polls.** S3/MinIO buckets in development emit no notifications, so the sweep is the primary
+  mechanism for anything written by *another* process, and `github.webhook_poll_interval` (1 s) shortens
+  `events.sweep_interval` while the GitHub sink is on. For the same reason a sweep that finds work logs at
+  debug rather than warning about missing notifications.
+
+`pull_request` is the exception: PR state is JSON in the bucket, not WAL, so there is nothing to tail. The
+handler spawns the delivery after the CAS lands and retries it a couple of times; a failure is a warn line
+and nothing else. `synchronize` is not a handler event at all — it is derived from the push, which is why
+it is exact even when the branch moved by `git push` rather than through the API.

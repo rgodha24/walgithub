@@ -176,6 +176,7 @@ pub async fn commit_on_ref(
 
     drop(guard);
     publish(
+        st,
         &handle,
         &req.ref_name,
         expected.as_deref().unwrap_or_default(),
@@ -204,7 +205,7 @@ pub async fn create_ref(
     }
     require_object(&local, oid)?;
     drop(guard);
-    publish(&handle, ref_name, "", oid, None).await
+    publish(st, &handle, ref_name, "", oid, None).await
 }
 
 /// `PATCH /git/refs/{ref}`: move `ref_name` to `oid`. Fast-forward unless
@@ -241,7 +242,7 @@ pub async fn update_ref(
         ));
     }
     drop(guard);
-    publish(&handle, ref_name, &current, oid, None).await
+    publish(st, &handle, ref_name, &current, oid, None).await
 }
 
 /// `DELETE /git/refs/{ref}`.
@@ -254,12 +255,13 @@ pub async fn delete_ref(st: &Arc<AppState>, id: &RepoId, ref_name: &str) -> GhRe
         return Err(GhError::not_found(ref_name));
     };
     drop(guard);
-    publish(&handle, ref_name, &current, "", None).await
+    publish(st, &handle, ref_name, &current, "", None).await
 }
 
 /// One ref update through the WAL: pack PUT ∥ log PUT → manifest CAS. `old`
 /// and `new` are hex or `""` (create / delete).
 async fn publish(
+    st: &Arc<AppState>,
     handle: &Arc<walgit_wal::RepoHandle>,
     ref_name: &str,
     old: &str,
@@ -288,14 +290,14 @@ async fn publish(
     for (name, outcome) in res.per_ref {
         if let Err(e) = outcome {
             return Err(match e {
-                walgit_wal::RefError::Conflict { expected, actual } => GhError::Conflict(format!(
-                    "{name} moved: expected {expected}, found {actual}"
-                )),
+                walgit_wal::RefError::Conflict { expected, actual } => {
+                    GhError::Conflict(format!("{name} moved: expected {expected}, found {actual}"))
+                }
                 other => GhError::Conflict(format!("{name}: {other}")),
             });
         }
     }
-    super::events::ref_written(handle.id(), ref_name, old, new, res.seq);
+    super::events::ref_written(st, handle.id(), ref_name, old, new, res.seq);
     Ok(RefWritten {
         ref_name: ref_name.to_string(),
         oid: new.to_string(),
@@ -503,7 +505,11 @@ fn validate_ref_name(name: &str) -> GhResult<()> {
     }
     Err(GhError::validation(
         "Validation Failed",
-        FieldError::invalid("Reference", "ref", format!("{name} is not a valid ref name")),
+        FieldError::invalid(
+            "Reference",
+            "ref",
+            format!("{name} is not a valid ref name"),
+        ),
     ))
 }
 
@@ -511,7 +517,9 @@ fn validate_path(path: &str) -> GhResult<()> {
     let ok = !path.is_empty()
         && !path.starts_with('/')
         && !path.ends_with('/')
-        && !path.split('/').any(|s| s.is_empty() || s == "." || s == "..")
+        && !path
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
         && !path.contains('\0');
     if ok {
         return Ok(());

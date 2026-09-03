@@ -188,7 +188,13 @@ pub async fn merge_into_ref(
         .map_err(|e| GhError::Internal(format!("connectivity: {e}")))?;
     drop(guard);
 
-    publish(&handle, &[(base_ref, base.as_str(), built.as_str())], ingested).await?;
+    publish(
+        st,
+        &handle,
+        &[(base_ref, base.as_str(), built.as_str())],
+        ingested,
+    )
+    .await?;
     Ok(Outcome::Merged(built))
 }
 
@@ -202,6 +208,7 @@ fn message(title: &str, body: &str) -> String {
 /// Publish one or more ref updates with an optional pack, through the same
 /// path `write.rs` uses: pack PUT ∥ log PUT → manifest CAS.
 pub async fn publish(
+    st: &Arc<AppState>,
     handle: &Arc<walgit_wal::RepoHandle>,
     updates: &[(&str, &str, &str)],
     pack: Option<walgit_git::IngestedPack>,
@@ -237,7 +244,7 @@ pub async fn publish(
         }
     }
     for (name, old, new) in updates {
-        super::events::ref_written(handle.id(), name, old, new, res.seq);
+        super::events::ref_written(st, handle.id(), name, old, new, res.seq);
     }
     Ok(res.seq)
 }
@@ -454,7 +461,7 @@ pub async fn generate(
     drop(guard);
 
     let full_ref = format!("refs/heads/{branch}");
-    publish(&handle, &[(&full_ref, "", tip.as_str())], ingested).await?;
+    publish(&st, &handle, &[(&full_ref, "", tip.as_str())], ingested).await?;
     publish_head(&handle, &full_ref).await?;
 
     let urls = super::models::Urls::from_request(&st, &headers);

@@ -426,6 +426,19 @@ decision in §4 — or the PR is; never "fix later".
   it is not WAL, not replayed, and nothing outside `github/` reads it, so it does not widen the bucket
   contract §2 defines. Everything else in D42 stands — the trust boundary, the `validate` refusal, and
   writes going through `ingest_pack` → `publish_push_synced` and no second path, merges included.
+  **(2026-09-03)** The facade now emits **outbound GitHub webhooks** (`docs/GITHUB.md` §11), and the "no
+  events from the write path" clause is honoured rather than dropped: `push` / `create` / `delete` (and
+  `pull_request.synchronize`) are rendered by a second sink on the **events bridge** (`crate::bridge`,
+  `github/webhook.rs`) from log entries read at a durable cursor, so a delivery happens iff the entry is
+  durable, a non-2xx keeps the cursor, and a dead consumer costs receive-pack nothing. `[github]` gains
+  `webhook_url`, `webhook_secret`, `installation_id` (default 1) and `webhook_poll_interval` (default 1 s);
+  the bridge runs on the default empty `roles`, so a standalone facade needs no roles setting. Two
+  concessions, both scoped to this sink: a write on the same instance calls `Bridge::wake` so the typical
+  push-to-delivery latency is ~20 ms rather than a poll interval (the walgit-native bus keeps exactly
+  `docs/EVENTS.md`'s two wake-ups), and a dev bucket's missing notifications make a productive sweep a debug
+  line instead of a warning. The one thing not from the WAL is `pull_request` itself — PR state is the
+  facade's own JSON, not log entries — so those deliveries are spawned from the handlers, best effort with a
+  couple of retries, and never awaited by a request.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 

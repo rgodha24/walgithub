@@ -58,6 +58,11 @@ pub struct Bridge {
     /// carry it, the registry's store strips it.
     store_prefix: String,
     sinks: Vec<Box<dyn Sink>>,
+    /// The GitHub facade's sink is on. It changes two things and nothing else
+    /// (`docs/GITHUB.md` §Webhooks): a write on this instance wakes the bridge
+    /// directly, and a sweep that finds work is the design rather than an
+    /// alarm — a dev bucket has no notifications to be missing.
+    github_sink: bool,
     serial: tokio::sync::Mutex<()>,
 }
 
@@ -78,6 +83,13 @@ impl Bridge {
                 cfg.events.webhook_secret.clone().filter(|s| !s.is_empty()),
             )));
         }
+        // The GitHub facade's own sink (`docs/GITHUB.md` §Webhooks): the same
+        // WAL entries, rendered as GitHub `push` / `create` / `delete`
+        // deliveries. Independent of the walgit-native array webhook above.
+        let github_sink = cfg.github.webhook_url.is_some();
+        if let Some(sender) = crate::github::webhook::Sender::from_cfg(cfg) {
+            sinks.push(Box::new(crate::github::webhook::GithubSink::new(sender)));
+        }
         if sinks.is_empty() {
             return None;
         }
@@ -89,8 +101,38 @@ impl Bridge {
             registry,
             store_prefix: cfg.store_prefix(),
             sinks,
+            github_sink,
             serial: tokio::sync::Mutex::new(()),
         }))
+    }
+
+    /// Hand every sink the instance it belongs to. Called once, right after
+    /// the `AppState` Arc exists.
+    pub fn attach_state(&self, st: &Arc<crate::AppState>) {
+        for sink in &self.sinks {
+            sink.attach_state(st);
+        }
+    }
+
+    /// In-process wake-up: this instance just committed something for `id`, so
+    /// catch up now instead of waiting for the next sweep. Spawned — a writer
+    /// never waits on a webhook (invariant 1).
+    ///
+    /// Only the GitHub facade uses it (`docs/GITHUB.md` §Webhooks). The
+    /// walgit-native bus keeps `docs/EVENTS.md`'s two wake-ups exactly —
+    /// `POST /_events/notify` and the sweep — because a production bridge is a
+    /// separate service and must not depend on being co-located with a writer.
+    pub fn wake(self: &Arc<Self>, id: &RepoId) {
+        if !self.github_sink {
+            return;
+        }
+        let bridge = self.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bridge.catch_up(&id).await {
+                tracing::warn!(repo = %id, error = %e, "events bridge: wake catch-up failed");
+            }
+        });
     }
 
     /// Publish everything committed after the cursor, then advance it.
@@ -190,8 +232,13 @@ impl Bridge {
                 Ok(c) if c.emitted > 0 => {
                     metrics::counter!("events_bridge_sweep_found_total")
                         .increment(c.emitted as u64);
-                    tracing::warn!(repo = %id, emitted = c.emitted,
-                        "events bridge: sweep found unpublished entries — are the GCS notifications flowing?");
+                    if self.github_sink {
+                        tracing::debug!(repo = %id, emitted = c.emitted,
+                            "events bridge: sweep published (polling, docs/GITHUB.md)");
+                    } else {
+                        tracing::warn!(repo = %id, emitted = c.emitted,
+                            "events bridge: sweep found unpublished entries — are the GCS notifications flowing?");
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -354,12 +401,20 @@ fn auth_err(e: crate::auth::AuthError) -> crate::error::ApiError {
     }
 }
 
-/// `events.sweep_interval` timer (0 = off).
+/// The sweep timer: `events.sweep_interval`, shortened to
+/// `github.webhook_poll_interval` when the GitHub sink is on (a dev bucket has
+/// no notifications, and the editor suite waits seconds, not minutes). 0 = off.
 pub fn spawn_sweeper(state: Arc<crate::AppState>) {
     let Some(bridge) = state.bridge.clone() else {
         return;
     };
-    let every = state.cfg.events.sweep_interval;
+    let mut every = state.cfg.events.sweep_interval;
+    if state.cfg.github.webhook_url.is_some() {
+        let poll = state.cfg.github.webhook_poll_interval;
+        if !poll.is_zero() && (every.is_zero() || poll < every) {
+            every = poll;
+        }
+    }
     if every.is_zero() {
         return;
     }
@@ -384,6 +439,7 @@ mod tests {
             ),
             store_prefix: "prefix/".into(),
             sinks: Vec::new(),
+            github_sink: false,
             serial: tokio::sync::Mutex::new(()),
         };
         let id = b

@@ -1,15 +1,18 @@
-//! The hook point where a GitHub-shaped webhook would be produced.
+//! The one call site every facade write makes once it is committed.
 //!
-//! Deliberately not a producer. Principle III: side effects are readers of the
-//! WAL, never steps of a write — a `push` or `pull_request` delivery must come
-//! from something tailing the log from a durable cursor (`crate::bridge`,
-//! `docs/EVENTS.md`), so that a failed delivery cannot fail a write and a
-//! replay from the cursor is exact. What lives here is the *shape* and the one
-//! call site every facade write already makes, so the later phase is a sink
-//! registration and a converter, not a hunt through `write.rs` for the places
-//! a write completes.
+//! Still not a producer. Principle III: side effects are readers of the WAL,
+//! never steps of a write — the `push` / `create` / `delete` deliveries are
+//! rendered by [`super::webhook::GithubSink`] from log entries the bridge
+//! reads from a durable cursor (`crate::bridge`, `docs/EVENTS.md`), so a
+//! failed delivery cannot fail a write and a replay from the cursor is exact.
+//! What happens here is a *wake-up*: the bridge is told there is something to
+//! read, which only saves it a poll interval and is spawned, never awaited.
+
+use std::sync::Arc;
 
 use walgit_git::RepoId;
+
+use crate::AppState;
 
 /// What the facade did, in GitHub's vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +33,16 @@ impl Kind {
 /// CAS, never before: nothing may observe a write the WAL has not committed.
 ///
 /// `old` / `new` are hex or `""` (create / delete), matching the WAL's own
-/// convention rather than GitHub's forty zeros; a converter maps them when
-/// there is a payload to convert.
-pub fn ref_written(repo: &RepoId, ref_name: &str, old: &str, new: &str, seq: u64) {
+/// convention rather than GitHub's forty zeros; the sink maps them to the
+/// forty zeros the payload carries.
+pub fn ref_written(
+    st: &Arc<AppState>,
+    repo: &RepoId,
+    ref_name: &str,
+    old: &str,
+    new: &str,
+    seq: u64,
+) {
     tracing::debug!(
         repo = %repo,
         event = Kind::Push.as_str(),
@@ -42,4 +52,7 @@ pub fn ref_written(repo: &RepoId, ref_name: &str, old: &str, new: &str, seq: u64
         seq,
         "github facade write committed"
     );
+    if let Some(bridge) = &st.bridge {
+        bridge.wake(repo);
+    }
 }

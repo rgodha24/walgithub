@@ -226,7 +226,7 @@ fn live_head(view: &View, pr: &PullRequest) -> String {
         .map_or_else(|| pr.head.sha.clone(), ToString::to_string)
 }
 
-fn repo_json(view: &View, urls: &Urls) -> Value {
+pub(super) fn repo_json(view: &View, urls: &Urls) -> Value {
     let default_branch = view
         .index
         .head_target
@@ -257,17 +257,17 @@ struct Detail {
 /// GitHub's PR object. `detail` fills the fields GitHub itself only computes
 /// for a single-PR read.
 fn pr_json(
-    ctx: &Ctx,
+    view: &View,
+    urls: &Urls,
     pr: &PullRequest,
     head_sha: &str,
     detail: Option<&Detail>,
 ) -> Value {
-    let urls = &ctx.urls;
-    let full = &ctx.view.full_name;
+    let full = &view.full_name;
     let base = format!("{}/repos/{full}", urls.api);
     let n = pr.number;
     let owner = full.split('/').next().unwrap_or("");
-    let repo = repo_json(&ctx.view, urls);
+    let repo = repo_json(view, urls);
     let user = serde_json::to_value(models::named_user(urls, &pr.user)).unwrap_or(Value::Null);
     let mut body = json!({
         "id": models::id_for(&format!("{full}#pull{n}")),
@@ -333,6 +333,61 @@ fn pr_json(
         obj.insert("changed_files".into(), json!(d.changed_files));
     }
     body
+}
+
+/// A `pull_request` webhook body (`docs/GITHUB_SHAPES.md` Tier 5): the same PR
+/// object every read renders, plus the repository, the installation and the
+/// sender. One definition, so a handler and the WAL-driven `synchronize` agree.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn event_payload(
+    view: &View,
+    urls: &Urls,
+    repository: &Value,
+    action: &str,
+    pr: &PullRequest,
+    head_sha: &str,
+    installation: &Value,
+    sender: &Value,
+) -> Value {
+    json!({
+        "action": action,
+        "number": pr.number,
+        "pull_request": pr_json(view, urls, pr, head_sha, None),
+        "repository": repository,
+        "installation": installation,
+        "sender": sender,
+    })
+}
+
+/// Send one `pull_request` delivery for a PR this request just changed.
+/// Spawned: a handler never waits on a webhook.
+pub(super) fn emit_for(
+    st: &Arc<AppState>,
+    view: &View,
+    urls: &Urls,
+    action: &'static str,
+    pr: &PullRequest,
+) {
+    if st.cfg.github.webhook_url.is_none() {
+        return;
+    }
+    let head_sha = live_head(view, pr);
+    let payload = event_payload(
+        view,
+        urls,
+        &repo_json(view, urls),
+        action,
+        pr,
+        &head_sha,
+        &json!({ "id": st.cfg.github.installation_id }),
+        &serde_json::to_value(models::named_user(urls, super::auth::USER_LOGIN))
+            .unwrap_or(Value::Null),
+    );
+    super::webhook::spawn(st, "pull_request", payload);
+}
+
+fn emit(st: &Arc<AppState>, ctx: &Ctx, action: &'static str, pr: &PullRequest) {
+    emit_for(st, &ctx.view, &ctx.urls, action, pr);
 }
 
 /// The PR rendered as an issue — what `GET /issues/{n}` and `/search/issues`
@@ -456,13 +511,25 @@ async fn create_pull(
         .view
         .index
         .branch(&head_ref)
-        .ok_or_else(|| validation("PullRequest", "head", format!("No commit found for the ref {head_ref}")))?
+        .ok_or_else(|| {
+            validation(
+                "PullRequest",
+                "head",
+                format!("No commit found for the ref {head_ref}"),
+            )
+        })?
         .to_string();
     let base_sha = ctx
         .view
         .index
         .branch(&base_ref)
-        .ok_or_else(|| validation("PullRequest", "base", format!("No commit found for the ref {base_ref}")))?
+        .ok_or_else(|| {
+            validation(
+                "PullRequest",
+                "base",
+                format!("No commit found for the ref {base_ref}"),
+            )
+        })?
         .to_string();
     if repo::commit_count(&ctx.view.local, &base_sha, &head_sha).await? == 0 {
         return Err(validation(
@@ -500,10 +567,7 @@ async fn create_pull(
             PullRequest {
                 number,
                 node_id: pr_store::node_id(&full, number),
-                title: req
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| head_ref.clone()),
+                title: req.title.clone().unwrap_or_else(|| head_ref.clone()),
                 body: req.body.clone().unwrap_or_default(),
                 state: "open".to_string(),
                 draft: req.draft,
@@ -535,10 +599,11 @@ async fn create_pull(
     )
     .await?;
 
+    emit(&st, &ctx, "opened", &created);
     let head_sha = live_head(&ctx.view, &created);
     Ok((
         StatusCode::CREATED,
-        Json(pr_json(&ctx, &created, &head_sha, None)),
+        Json(pr_json(&ctx.view, &ctx.urls, &created, &head_sha, None)),
     )
         .into_response())
 }
@@ -589,7 +654,7 @@ async fn list_pulls(
     for row in rows.iter().skip(page.skip()).take(page.per_page) {
         if let Some(pr) = pr_store::try_read(&ctx.store, row.number).await? {
             let head_sha = live_head(&ctx.view, &pr);
-            out.push(pr_json(&ctx, &pr, &head_sha, None));
+            out.push(pr_json(&ctx.view, &ctx.urls, &pr, &head_sha, None));
         }
     }
     let more = page.skip() + out.len() < total;
@@ -613,7 +678,7 @@ async fn get_pull(
     let (pr, _) = pr_store::read(&ctx.store, number).await?;
     let head_sha = live_head(&ctx.view, &pr);
     let detail = detail_for(&ctx, &pr, &head_sha).await?;
-    Ok(Json(pr_json(&ctx, &pr, &head_sha, Some(&detail))).into_response())
+    Ok(Json(pr_json(&ctx.view, &ctx.urls, &pr, &head_sha, Some(&detail))).into_response())
 }
 
 async fn detail_for(ctx: &Ctx, pr: &PullRequest, head_sha: &str) -> GhResult<Detail> {
@@ -682,6 +747,11 @@ async fn patch_pull(
             ));
         }
     }
+    let before = if st.cfg.github.webhook_url.is_some() {
+        pr_store::try_read(&ctx.store, number).await?
+    } else {
+        None
+    };
     let index = ctx.view.index.clone();
     let pr = pr_store::update(&ctx.store, number, |pr| {
         if let Some(t) = &req.title {
@@ -729,8 +799,23 @@ async fn patch_pull(
         Ok(())
     })
     .await?;
+    if let Some(b) = &before {
+        emit(&st, &ctx, patch_action(b, &pr), &pr);
+    }
     let head_sha = live_head(&ctx.view, &pr);
-    Ok(Json(pr_json(&ctx, &pr, &head_sha, None)).into_response())
+    Ok(Json(pr_json(&ctx.view, &ctx.urls, &pr, &head_sha, None)).into_response())
+}
+
+/// Which `pull_request` action a `PATCH` amounted to. GitHub sends one event
+/// per edit and these are the actions the consumer subscribes to.
+fn patch_action(before: &PullRequest, after: &PullRequest) -> &'static str {
+    match (before.is_open(), after.is_open()) {
+        (true, false) => "closed",
+        (false, true) => "reopened",
+        _ if before.draft && !after.draft => "ready_for_review",
+        _ if !before.draft && after.draft => "converted_to_draft",
+        _ => "edited",
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -885,7 +970,7 @@ async fn commit_pulls(
     for row in index.prs.iter().filter(|r| matches(r)) {
         if let Some(pr) = pr_store::try_read(&ctx.store, row.number).await? {
             let head_sha = live_head(&ctx.view, &pr);
-            out.push(pr_json(&ctx, &pr, &head_sha, None));
+            out.push(pr_json(&ctx.view, &ctx.urls, &pr, &head_sha, None));
         }
     }
     Ok(Json(out).into_response())
@@ -970,7 +1055,7 @@ async fn merge_pull(
     };
     let merged_sha = sha.clone();
     let frozen = head_sha.clone();
-    pr_store::update(&ctx.store, number, |pr| {
+    let merged_pr = pr_store::update(&ctx.store, number, |pr| {
         pr.state = "closed".to_string();
         pr.merged = true;
         pr.merged_at = Some(pr_store::now());
@@ -980,6 +1065,7 @@ async fn merge_pull(
         Ok(())
     })
     .await?;
+    emit(&st, &ctx, "closed", &merged_pr);
     Ok(Json(json!({
         "sha": sha,
         "merged": true,
@@ -1029,10 +1115,7 @@ async fn merge_branches(
     .await?;
     match outcome {
         Outcome::UpToDate => Ok(StatusCode::NO_CONTENT.into_response()),
-        Outcome::Conflict => Ok(merge::status_error(
-            StatusCode::CONFLICT,
-            "Merge conflict",
-        )),
+        Outcome::Conflict => Ok(merge::status_error(StatusCode::CONFLICT, "Merge conflict")),
         Outcome::Merged(sha) => {
             let facts = repo::commit_facts(&ctx.view.local, &sha).await?;
             let commit = models::commit(&ctx.urls, &ctx.view.full_name, &facts);
@@ -1210,7 +1293,7 @@ async fn request_reviewers(
     let head_sha = live_head(&ctx.view, &pr);
     Ok((
         StatusCode::CREATED,
-        Json(pr_json(&ctx, &pr, &head_sha, None)),
+        Json(pr_json(&ctx.view, &ctx.urls, &pr, &head_sha, None)),
     )
         .into_response())
 }
@@ -1237,7 +1320,14 @@ async fn list_comments(
 ) -> GhResult<Response> {
     let ctx = refs_ctx(&st, &headers, &owner, &name).await?;
     let (pr, _) = pr_store::read(&ctx.store, number).await?;
-    Ok(comment_page(&ctx, number, &pr.comments, &q, false, "issues"))
+    Ok(comment_page(
+        &ctx,
+        number,
+        &pr.comments,
+        &q,
+        false,
+        "issues",
+    ))
 }
 
 /// `GET /repos/{o}/{r}/pulls/{n}/comments` — review comments.
@@ -1338,7 +1428,11 @@ async fn add_comment(
         Ok(())
     })
     .await?;
-    let list = if review { &pr.review_comments } else { &pr.comments };
+    let list = if review {
+        &pr.review_comments
+    } else {
+        &pr.comments
+    };
     let c = list
         .iter()
         .find(|c| c.id == created)

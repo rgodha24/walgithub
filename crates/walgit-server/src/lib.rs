@@ -93,7 +93,7 @@ impl AppState {
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
         }
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             cfg: cfg.clone(),
             store,
             registry,
@@ -108,7 +108,13 @@ impl AppState {
             bridge,
             follow: follow::FollowStatuses::default(),
             tls,
-        }))
+        });
+        // The GitHub sink renders its payloads out of the repository, so it
+        // needs this instance — which did not exist when the bridge was built.
+        if let Some(b) = &state.bridge {
+            b.attach_state(&state);
+        }
+        Ok(state)
     }
 }
 

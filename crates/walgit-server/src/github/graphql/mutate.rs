@@ -171,7 +171,10 @@ fn file_changes(changes: Option<&Value>) -> Result<Vec<write::Change>, GqlError>
             .get("contents")
             .and_then(Value::as_str)
             .ok_or_else(|| GqlError::bad_request("fileChanges.additions[].contents is required"))?;
-        let stripped: String = encoded.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        let stripped: String = encoded
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(stripped)
             .map_err(|e| {
@@ -214,11 +217,20 @@ async fn set_draft(ctx: &Ctx, f: &Field, draft: bool) -> Result<Value, GqlError>
     let node = input_str(input, "pullRequestId")
         .ok_or_else(|| GqlError::bad_request("input.pullRequestId is required"))?;
     let parsed = NodeId::parse(&node).ok_or_else(|| {
-        GqlError::not_found(format!("Could not resolve to a PullRequest with the id {node}."))
+        GqlError::not_found(format!(
+            "Could not resolve to a PullRequest with the id {node}."
+        ))
     })?;
     let (id, number) = parsed.target();
-    let store = ctx.refs(id).await?.handle.store().clone();
+    let view = ctx.refs(id).await?;
+    let store = view.handle.store().clone();
     let pr = pr_store::set_draft(&store, number, draft).await?;
+    let action = if draft {
+        "converted_to_draft"
+    } else {
+        "ready_for_review"
+    };
+    crate::github::prs::emit_for(&ctx.st, &view, &ctx.urls, action, &pr);
     Ok(json!({
         "pullRequest": pull_request_node(ctx, &pr),
         "clientMutationId": input.get("clientMutationId").cloned().unwrap_or(Value::Null),
@@ -243,8 +255,8 @@ async fn add_review_thread(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
         NodeId::Review { review, .. } => Some(review.clone()),
         NodeId::PullRequest { .. } | NodeId::ReviewThread { .. } => None,
     };
-    let path = input_str(input, "path")
-        .ok_or_else(|| GqlError::bad_request("input.path is required"))?;
+    let path =
+        input_str(input, "path").ok_or_else(|| GqlError::bad_request("input.path is required"))?;
     let thread = ReviewThread {
         id: String::new(),
         review_id: review,

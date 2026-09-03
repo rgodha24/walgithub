@@ -32,7 +32,10 @@
 //! - [`stubs`] — check runs, deployments and statuses (accept-and-forget).
 //! - [`graphql`] — `POST /api/graphql`, dispatched on field names.
 //! - [`error`] — `{message, documentation_url}` with GitHub's statuses.
-//! - [`events`] — where a webhook would be produced (a WAL reader, later).
+//! - [`events`] — the post-commit hook that wakes the events bridge.
+//! - [`webhook`] — outbound GitHub webhooks: the signed sender, the bridge
+//!   sink that renders `push`/`create`/`delete` from the WAL, and the
+//!   `pull_request` deliveries the PR handlers send.
 
 pub mod auth;
 pub mod compare;
@@ -49,6 +52,7 @@ pub mod reads;
 pub mod repo;
 pub mod router;
 pub mod stubs;
+pub mod webhook;
 pub mod write;
 
 pub use router::router;
