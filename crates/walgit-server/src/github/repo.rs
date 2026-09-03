@@ -82,6 +82,7 @@ pub async fn refs_view(st: &Arc<AppState>, id: &RepoId) -> GhResult<View> {
 /// Refs plus objects on this instance's disk.
 pub async fn objects_view(st: &Arc<AppState>, id: &RepoId) -> GhResult<View> {
     let handle = open(st, id).await?;
+    drop(handle.sync_refs().await?);
     let (guard, access) = handle.sync_objects().await?;
     if access.is_remote() {
         drop(guard);
