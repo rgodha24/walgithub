@@ -35,7 +35,6 @@ pub mod error;
 pub mod mutate;
 pub mod ops;
 pub mod parse;
-pub mod prs;
 
 use std::sync::Arc;
 

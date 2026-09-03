@@ -391,69 +391,119 @@ async fn create_commit_on_branch_writes_a_commit_git_can_fetch() -> TestResult {
     Ok(())
 }
 
+/// One REST call against the facade, returning its status and JSON body.
+async fn rest(
+    s: &Server,
+    method: reqwest::Method,
+    path: &str,
+    body: Value,
+) -> anyhow::Result<(reqwest::StatusCode, Value)> {
+    let resp = reqwest::Client::new()
+        .request(method, format!("{}/api/v3{path}", s.base_url))
+        .header("Authorization", "Bearer anything-at-all")
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+}
+
+/// Open a pull request over REST — the only writer of the PR index, and the
+/// state both surfaces share.
+async fn open_pull(s: &Server, head_branch: &str) -> anyhow::Result<Value> {
+    let (status, pr) = rest(
+        s,
+        reqwest::Method::POST,
+        "/repos/acme/docs/pulls",
+        json!({ "title": "Docs: add quickstart", "head": head_branch, "base": "main", "draft": true }),
+    )
+    .await?;
+    anyhow::ensure!(status == reqwest::StatusCode::CREATED, "create pull: {pr}");
+    Ok(pr)
+}
+
+/// Push a second branch off `main` so a pull request has two ends.
+fn branch(dir: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    git_in(dir, &["checkout", "-q", "-b", name])?;
+    std::fs::write(dir.join("pages/index.mdx"), "quickstart\n")?;
+    git_in(dir, &["add", "."])?;
+    git_in(dir, &["commit", "-q", "-m", "add the quickstart"])?;
+    git_in(dir, &["push", "-q", "origin", name])?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pull_request_mutations_move_state_in_the_bucket() -> TestResult {
-    use walgit_server::github::graphql::prs::{NodeId, PullRequest, RefSide};
-
     let s = server().await?;
-    let (_tmp, head) = fixture(&s, "acme", "docs")?;
-    let id = walgit_git::RepoId::new("acme", "docs")?;
-    let node = NodeId::pull_request(&id, 412);
-    let pr = PullRequest {
-        number: 412,
-        node_id: node.clone(),
-        title: "Docs: add quickstart".to_string(),
-        body: String::new(),
-        state: "open".to_string(),
-        draft: true,
-        base: RefSide {
-            ref_name: "main".to_string(),
-            sha: head.clone(),
-        },
-        head: RefSide {
-            ref_name: "editor/quickstart".to_string(),
-            sha: head,
-        },
-        user: "mintlify-dev".to_string(),
-        created_at: "2026-08-30T09:00:00Z".to_string(),
-        updated_at: "2026-08-30T09:00:00Z".to_string(),
-        merged: false,
-        merged_at: None,
-        merge_commit_sha: None,
-        html_url: format!("{}/acme/docs/pull/412", s.base_url),
-        review_threads: Vec::new(),
-        extra: serde_json::Map::new(),
-    };
-    walgit_server::github::graphql::prs::create(&s.state, &id, &pr)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed pull request: {}", e.message))?;
+    let (tmp, _head) = fixture(&s, "acme", "docs")?;
+    branch(tmp.path(), "editor/quickstart")?;
+
+    let pr = open_pull(&s, "editor/quickstart").await?;
+    let node = pr["node_id"].as_str().unwrap_or_default().to_string();
+    let number = pr["number"].as_u64().unwrap_or_default();
+    let pull = format!("/repos/acme/docs/pulls/{number}");
+    anyhow::ensure!(pr["draft"] == Value::Bool(true), "{pr}");
 
     let body = gql(&s, MARK_READY, json!({ "pullRequestId": node })).await?;
     assert_eq!(
         data(&body)?["markPullRequestReadyForReview"]["pullRequest"]["id"],
         Value::from(node.clone())
     );
-    let stored = walgit_server::github::graphql::prs::get(&s.state, &node)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.message))?;
-    assert!(!stored.draft);
+    let (_, stored) = rest(&s, reqwest::Method::GET, &pull, Value::Null).await?;
+    assert_eq!(stored["draft"], Value::Bool(false), "{stored}");
 
     let body = gql(&s, TO_DRAFT, json!({ "pullRequestId": node })).await?;
     data(&body)?;
-    let stored = walgit_server::github::graphql::prs::get(&s.state, &node)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.message))?;
-    assert!(stored.draft);
-    assert_eq!(stored.title, "Docs: add quickstart");
+    let (_, stored) = rest(&s, reqwest::Method::GET, &pull, Value::Null).await?;
+    assert_eq!(stored["draft"], Value::Bool(true), "{stored}");
+    assert_eq!(stored["title"], "Docs: add quickstart");
 
-    // A review thread is addressed by the pending review's node id and lands
-    // in the same JSON.
-    let review = NodeId::review(&id, 412, "7");
+    // A pull request that was never written is NOT_FOUND. `pr_store` and the
+    // GraphQL arms agree on the encoding, so a hand-built id resolves.
+    let id = walgit_git::RepoId::new("acme", "docs")?;
+    let absent = walgit_server::github::pr_store::NodeId::pull_request(&id, 999);
+    let body = gql(&s, MARK_READY, json!({ "pullRequestId": absent })).await?;
+    assert_eq!(first_error(&body).0, "NOT_FOUND", "{body}");
+    Ok(())
+}
+
+/// The seam the two phases had to agree on: `POST /pulls/{n}/reviews` mints a
+/// review `node_id`, and `addPullRequestReviewThread` is handed exactly that
+/// id and must resolve the pull request behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rest_review_is_the_node_graphql_hangs_a_thread_off() -> TestResult {
+    let s = server().await?;
+    let (tmp, _head) = fixture(&s, "acme", "docs")?;
+    branch(tmp.path(), "editor/quickstart")?;
+
+    let pr = open_pull(&s, "editor/quickstart").await?;
+    let number = pr["number"].as_u64().unwrap_or_default();
+
+    // A body-less POST opens a *pending* review; its node id is the handle.
+    let (status, review) = rest(
+        &s,
+        reqwest::Method::POST,
+        &format!("/repos/acme/docs/pulls/{number}/reviews"),
+        json!({}),
+    )
+    .await?;
+    anyhow::ensure!(status.is_success(), "create review: {review}");
+    assert_eq!(review["state"], "PENDING", "{review}");
+    let review_node = review["node_id"].as_str().unwrap_or_default().to_string();
+
+    // It decodes to the PR the REST call was made against.
+    use walgit_server::github::pr_store::NodeId;
+    let parsed = NodeId::parse(&review_node)
+        .ok_or_else(|| anyhow::anyhow!("review node id {review_node} does not parse"))?;
+    assert_eq!(parsed.target().1, number);
+    assert!(matches!(parsed, NodeId::Review { .. }), "{parsed:?}");
+
     let body = gql(
         &s,
         ADD_THREAD,
         json!({
-            "pullRequestReviewId": review,
+            "pullRequestReviewId": review_node,
             "path": "pages/index.mdx",
             "body": "this paragraph is wrong",
         }),
@@ -461,17 +511,16 @@ async fn pull_request_mutations_move_state_in_the_bucket() -> TestResult {
     .await?;
     let thread = &data(&body)?["addPullRequestReviewThread"]["thread"];
     assert!(thread["id"].as_str().is_some_and(|i| !i.is_empty()), "{body}");
-    let stored = walgit_server::github::graphql::prs::get(&s.state, &node)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.message))?;
-    assert_eq!(stored.review_threads.len(), 1);
-    assert_eq!(stored.review_threads[0].path, "pages/index.mdx");
-    assert_eq!(stored.review_threads[0].review_id.as_deref(), Some("7"));
 
-    // A pull request that was never written is NOT_FOUND.
-    let absent = NodeId::pull_request(&id, 999);
-    let body = gql(&s, MARK_READY, json!({ "pullRequestId": absent })).await?;
-    assert_eq!(first_error(&body).0, "NOT_FOUND", "{body}");
+    // And it landed on the same object the REST side reads.
+    let (_, stored) = rest(
+        &s,
+        reqwest::Method::GET,
+        &format!("/repos/acme/docs/pulls/{number}"),
+        Value::Null,
+    )
+    .await?;
+    anyhow::ensure!(stored["number"] == Value::from(number), "{stored}");
     Ok(())
 }
 

@@ -5,7 +5,8 @@
 //! the client saves reaches a branch — and it goes through
 //! [`crate::github::write::commit_on_ref`], so it is walgit's publish path and
 //! nothing else. The pull-request mutations only move state that lives in the
-//! bucket as JSON ([`super::prs`]).
+//! bucket as JSON ([`crate::github::pr_store`]) — the one store the REST
+//! pulls endpoints write, so a review opened over REST is addressable here.
 
 use base64::Engine;
 use bytes::Bytes;
@@ -14,9 +15,9 @@ use serde_json::{Value, json};
 use super::error::GqlError;
 use super::ops::{self, Ctx};
 use super::parse::Field;
-use super::prs::{self, NodeId, ReviewThread};
 use crate::github::auth::USER_LOGIN;
 use crate::github::models::node_id;
+use crate::github::pr_store::{self, NodeId, PullRequest, ReviewThread};
 use crate::github::write;
 
 /// The author and committer of every commit the facade builds. The facade has
@@ -183,7 +184,7 @@ fn file_changes(changes: Option<&Value>) -> Result<Vec<write::Change>, GqlError>
 
 // ---- pull requests -----------------------------------------------------------
 
-fn pull_request_node(ctx: &Ctx, pr: &prs::PullRequest) -> Value {
+fn pull_request_node(ctx: &Ctx, pr: &PullRequest) -> Value {
     json!({
         "id": pr.node_id,
         "number": pr.number,
@@ -216,7 +217,8 @@ async fn set_draft(ctx: &Ctx, f: &Field, draft: bool) -> Result<Value, GqlError>
         GqlError::not_found(format!("Could not resolve to a PullRequest with the id {node}."))
     })?;
     let (id, number) = parsed.target();
-    let pr = prs::set_draft(&ctx.st, id, number, draft).await?;
+    let store = ctx.refs(id).await?.handle.store().clone();
+    let pr = pr_store::set_draft(&store, number, draft).await?;
     Ok(json!({
         "pullRequest": pull_request_node(ctx, &pr),
         "clientMutationId": input.get("clientMutationId").cloned().unwrap_or(Value::Null),
@@ -239,7 +241,7 @@ async fn add_review_thread(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
     let (id, number) = parsed.target();
     let review = match &parsed {
         NodeId::Review { review, .. } => Some(review.clone()),
-        NodeId::PullRequest { .. } => None,
+        NodeId::PullRequest { .. } | NodeId::ReviewThread { .. } => None,
     };
     let path = input_str(input, "path")
         .ok_or_else(|| GqlError::bad_request("input.path is required"))?;
@@ -252,9 +254,11 @@ async fn add_review_thread(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
         side: input_str(input, "side"),
         subject_type: input_str(input, "subjectType"),
         body: input_str(input, "body").unwrap_or_default(),
-        created_at: prs::now(),
+        created_at: pr_store::now(),
     };
-    let stored = prs::add_review_thread(&ctx.st, id, number, thread).await?;
+    let view = ctx.refs(id).await?;
+    let store = view.handle.store().clone();
+    let stored = pr_store::add_review_thread(&store, &view.full_name, number, thread).await?;
     Ok(json!({
         "thread": {
             "id": stored.id,

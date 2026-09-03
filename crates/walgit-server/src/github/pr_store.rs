@@ -17,7 +17,11 @@
 //! object are written in two puts, so a crash between them leaves a row that
 //! is one edit stale; every read that needs precision reads the object.
 
+use std::str::FromStr;
+
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use walgit_git::RepoId;
 use walgit_store::{ObjectStoreExt, Prefixed, PutMode, Version};
 
 use super::error::{GhError, GhResult};
@@ -39,10 +43,122 @@ pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// `<owner>/<repo>#<number>#<tail>`, the body of every id but a PR's.
+fn three(rest: &str) -> Option<(RepoId, u64, String)> {
+    let mut parts = rest.splitn(3, '#');
+    let id = RepoId::from_str(parts.next()?).ok()?;
+    let number = parts.next()?.parse().ok()?;
+    Some((id, number, parts.next()?.to_string()))
+}
+
+fn b64(body: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(body)
+}
+
 /// GitHub's opaque PR node id: base64 of `PR_<owner>/<repo>#<n>`.
 pub fn node_id(full_name: &str, number: u64) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(format!("PR_{full_name}#{number}"))
+    b64(&format!("PR_{full_name}#{number}"))
+}
+
+/// The node id of one review: base64 of `PRR_<owner>/<repo>#<n>#<review id>`.
+///
+/// This is what `POST /pulls/{n}/reviews` mints and what GraphQL's
+/// `addPullRequestReviewThread` is handed back — the two surfaces address the
+/// same review, so the encoding is one function.
+pub fn review_node_id(full_name: &str, number: u64, review: u64) -> String {
+    b64(&format!("PRR_{full_name}#{number}#{review}"))
+}
+
+/// The node id of one review thread: base64 of
+/// `PRRT_<owner>/<repo>#<n>#<ordinal>`.
+pub fn thread_node_id(full_name: &str, number: u64, ordinal: usize) -> String {
+    b64(&format!("PRRT_{full_name}#{number}#{ordinal}"))
+}
+
+/// What a node id addresses. GitHub's are opaque base64 and no client parses
+/// them, so the facade's are base64 of a readable body and round-trip exactly
+/// (`docs/GITHUB.md` §node ids).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeId {
+    PullRequest {
+        id: RepoId,
+        number: u64,
+    },
+    Review {
+        id: RepoId,
+        number: u64,
+        review: String,
+    },
+    ReviewThread {
+        id: RepoId,
+        number: u64,
+        thread: String,
+    },
+}
+
+impl NodeId {
+    pub fn pull_request(id: &RepoId, number: u64) -> String {
+        node_id(&id.to_string(), number)
+    }
+
+    pub fn review(id: &RepoId, number: u64, review: u64) -> String {
+        review_node_id(&id.to_string(), number, review)
+    }
+
+    pub fn review_thread(id: &RepoId, number: u64, ordinal: usize) -> String {
+        thread_node_id(&id.to_string(), number, ordinal)
+    }
+
+    /// The repository and pull-request number a node id names, whichever kind
+    /// it is.
+    pub fn target(&self) -> (&RepoId, u64) {
+        match self {
+            NodeId::PullRequest { id, number }
+            | NodeId::Review { id, number, .. }
+            | NodeId::ReviewThread { id, number, .. } => (id, *number),
+        }
+    }
+
+    pub fn parse(node_id: &str) -> Option<Self> {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(node_id)
+            .ok()?;
+        let body = String::from_utf8(decoded).ok()?;
+        if let Some(rest) = body.strip_prefix("PRRT_") {
+            let (id, number, thread) = three(rest)?;
+            return Some(NodeId::ReviewThread { id, number, thread });
+        }
+        if let Some(rest) = body.strip_prefix("PRR_") {
+            let (id, number, review) = three(rest)?;
+            return Some(NodeId::Review { id, number, review });
+        }
+        let rest = body.strip_prefix("PR_")?;
+        let (repo, number) = rest.rsplit_once('#')?;
+        Some(NodeId::PullRequest {
+            id: RepoId::from_str(repo).ok()?,
+            number: number.parse().ok()?,
+        })
+    }
+}
+
+/// One review thread, appended by GraphQL's `addPullRequestReviewThread`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewThread {
+    pub id: String,
+    /// The review this thread belongs to, when the client opened one first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<String>,
+    pub body: String,
+    pub created_at: String,
 }
 
 /// One end of a pull request.
@@ -141,7 +257,7 @@ pub struct PullRequest {
     #[serde(default)]
     pub review_comments: Vec<Comment>,
     #[serde(default)]
-    pub review_threads: Vec<serde_json::Value>,
+    pub review_threads: Vec<ReviewThread>,
     #[serde(default = "yes")]
     pub maintainer_can_modify: bool,
     /// Monotonic id source for comments, reviews and reactions on this PR.
@@ -375,9 +491,40 @@ where
     ))
 }
 
+/// `markPullRequestReadyForReview` / `convertPullRequestToDraft`.
+pub async fn set_draft(store: &Prefixed, number: u64, draft: bool) -> GhResult<PullRequest> {
+    update(store, number, |pr| {
+        pr.draft = draft;
+        Ok(())
+    })
+    .await
+}
+
+/// `addPullRequestReviewThread`, appending to the PR's `review_threads`. The
+/// thread's own node id is minted here, so it is one ordinal per PR.
+pub async fn add_review_thread(
+    store: &Prefixed,
+    full_name: &str,
+    number: u64,
+    thread: ReviewThread,
+) -> GhResult<ReviewThread> {
+    let mut stored = None;
+    update(store, number, |pr| {
+        let mut t = thread.clone();
+        t.created_at = now();
+        t.id = thread_node_id(full_name, number, pr.review_threads.len().saturating_add(1));
+        pr.review_threads.push(t.clone());
+        stored = Some(t);
+        Ok(())
+    })
+    .await?;
+    stored.ok_or_else(|| GhError::Internal("review thread vanished".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Index, PullRequest, Row, Side, node_id};
+    use super::{Index, NodeId, PullRequest, Row, Side, node_id};
+    use walgit_git::RepoId;
 
     fn pr() -> PullRequest {
         PullRequest {
@@ -420,6 +567,36 @@ mod tests {
             .decode(node_id("acme/docs", 412))
             .expect("base64");
         assert_eq!(String::from_utf8_lossy(&raw), "PR_acme/docs#412");
+    }
+
+    #[test]
+    fn every_node_id_form_round_trips() {
+        let id = RepoId::new("acme", "docs").expect("repo id");
+        assert_eq!(
+            NodeId::parse(&NodeId::pull_request(&id, 412)),
+            Some(NodeId::PullRequest {
+                id: id.clone(),
+                number: 412
+            })
+        );
+        assert_eq!(
+            NodeId::parse(&NodeId::review(&id, 412, 412_000_001)),
+            Some(NodeId::Review {
+                id: id.clone(),
+                number: 412,
+                review: "412000001".to_string()
+            })
+        );
+        assert_eq!(
+            NodeId::parse(&NodeId::review_thread(&id, 412, 1)),
+            Some(NodeId::ReviewThread {
+                id,
+                number: 412,
+                thread: "1".to_string()
+            })
+        );
+        assert!(NodeId::parse("not base64 at all!!").is_none());
+        assert!(NodeId::parse("dW5rbm93bg==").is_none());
     }
 
     #[test]

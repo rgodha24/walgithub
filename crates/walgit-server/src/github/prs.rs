@@ -1120,7 +1120,7 @@ async fn create_review(
         created_id = id;
         pr.reviews.push(Review {
             id,
-            node_id: models::node_id("PullRequestReview", &format!("{full}#{id}")),
+            node_id: pr_store::review_node_id(&full, number, id),
             state: state.to_string(),
             body: req.body.clone().unwrap_or_default(),
             user: super::auth::USER_LOGIN.to_string(),
