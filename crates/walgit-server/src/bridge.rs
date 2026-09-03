@@ -130,7 +130,7 @@ impl Bridge {
         let id = id.clone();
         tokio::spawn(async move {
             if let Err(e) = bridge.catch_up(&id).await {
-                tracing::warn!(repo = %id, error = %e, "events bridge: wake catch-up failed");
+                tracing::warn!(repo = %id, error = format!("{e:#}"), "events bridge: wake catch-up failed");
             }
         });
     }
@@ -242,7 +242,7 @@ impl Bridge {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(repo = %id, error = %e, "events bridge: sweep catch-up failed")
+                    tracing::warn!(repo = %id, error = format!("{e:#}"), "events bridge: sweep catch-up failed")
                 }
             }
         }
