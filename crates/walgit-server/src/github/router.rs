@@ -61,7 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v3/repos/{owner}/{repo}/commits", get(repo::list_commits))
         .route(
             "/api/v3/repos/{owner}/{repo}/commits/{*ref}",
-            get(repo::get_commit),
+            get(super::prs::commit_or_subroute),
         )
         .route(
             "/api/v3/repos/{owner}/{repo}/branches",
@@ -93,6 +93,8 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .patch(update_ref)
                 .delete(delete_ref),
         )
+        .merge(super::prs::routes())
+        .merge(super::stubs::routes())
         .route("/api/graphql", post(graphql))
         .route("/api/v3/graphql", post(graphql))
         .route("/login/oauth/authorize", get(auth::authorize))
