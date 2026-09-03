@@ -20,6 +20,7 @@
 //! - [`write`] — the write primitive (commit, ref create/update/delete).
 //! - [`error`] — `{message, documentation_url}` with GitHub's statuses.
 //! - [`events`] — where a webhook would be produced (a WAL reader, later).
+//! - [`graphql`] — `POST /api/graphql`, dispatched on field names.
 
 pub mod auth;
 pub mod error;
@@ -28,5 +29,6 @@ pub mod models;
 pub mod repo;
 pub mod router;
 pub mod write;
+pub mod graphql;
 
 pub use router::router;
