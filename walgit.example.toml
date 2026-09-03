@@ -282,3 +282,12 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
 # webhook_url = "https://hooks.example.com/walgit"   # each batch of ref events is POSTed as a JSON array
 # webhook_secret = ""             # X-Walgit-Signature: sha256=<HMAC-SHA256 of the body>; unset = unsigned
 # sweep_interval = "5m"           # backstop + health check (warns when a sweep finds unpublished entries); 0 = off
+
+[github]                          # docs/GITHUB.md — a fake GitHub Enterprise Server over the same repositories:
+                                  # /api/v3/*, /api/graphql and /login/oauth/* so an octokit with
+                                  # baseUrl = http://<host>/api/v3 reads and writes the bucket. Local development
+                                  # only: auth-free by construction (any bearer, one hardcoded user, admin
+                                  # everywhere), so `validate` refuses it unless server.auth.mode = "none" or
+                                  # server.listen is loopback. Node will not trust the self-signed cert, so pair it
+                                  # with [server.tls] mode = "off".
+enabled = false

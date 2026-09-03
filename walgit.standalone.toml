@@ -93,6 +93,13 @@ base = "daily"
 schedule = "0 0 * * * *"
 chain = true
 
+[github]                          # docs/GITHUB.md — a fake GitHub Enterprise Server over these repositories, so an app
+enabled = true                    # that already supports GHES develops against walgit: point its install's baseUrl at
+                                  # http://127.0.0.1:8080/api/v3. Auth-free by construction (any bearer, one hardcoded
+                                  # user, admin everywhere) — hence loopback only, and never deployed. Node will not
+                                  # trust the self-signed certificate above, so set [server.tls] mode = "off" (and use
+                                  # http:// URLs) before pointing octokit here.
+
 [cache]
 dir = "/tmp/walgit"               # materialized repositories + tls/; wiped = warmth lost, nothing else
 max_bytes = "20GiB"

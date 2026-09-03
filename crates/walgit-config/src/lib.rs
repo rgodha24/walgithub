@@ -27,6 +27,7 @@ pub struct Config {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     pub events: EventsConfig,
+    pub github: GithubConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -768,6 +769,23 @@ impl Default for EventsConfig {
     }
 }
 
+/// `docs/GITHUB.md` — the GitHub Enterprise Server facade: `/api/v3/*`,
+/// `/api/graphql` and `/login/oauth/*` answered from the WAL so an octokit
+/// pointed at this host reads and writes real repositories in the bucket.
+///
+/// **Local development only.** The facade is auth-free by construction: it
+/// accepts any bearer, reports one hardcoded user with admin on everything and
+/// never consults `server.auth`. `Config::validate` therefore refuses
+/// `enabled = true` unless the process is already open by the same argument —
+/// `server.auth.mode = "none"` (itself loopback-only) or a loopback
+/// `server.listen`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct GithubConfig {
+    /// Mount the facade. Off everywhere but a developer's machine.
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
@@ -1025,6 +1043,7 @@ impl Default for Config {
             git: GitConfig::default(),
             telemetry: TelemetryConfig::default(),
             events: EventsConfig::default(),
+            github: GithubConfig::default(),
         }
     }
 }
@@ -1464,6 +1483,18 @@ impl Config {
                     && o.matches('*').count() <= 1
                     && (!o.contains('*') || o.contains("://*.")),
                 "server.cors_origins entries must be https origins (or http://localhost[:port]) with at most one leading `*.` wildcard, got {o:?}"
+            );
+        }
+        // The GitHub facade is its own trust boundary and has none: it accepts
+        // any credential and is admin on every repository. Mounting it on a
+        // host that is not already open to its network is a way to hand the
+        // bucket away, so it fails closed the way `auth.mode = none` does.
+        if self.github.enabled {
+            anyhow::ensure!(
+                self.server.auth.mode == AuthMode::None || self.server.listen.ip().is_loopback(),
+                "github.enabled is auth-free (any bearer is accepted, every repository is admin): it needs server.auth.mode = \"none\" or a loopback server.listen (listen is {}, auth.mode is {:?})",
+                self.server.listen,
+                self.server.auth.mode
             );
         }
         // Security contract: identity modes fail closed.
