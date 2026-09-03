@@ -48,10 +48,14 @@ pub struct View {
 
 async fn build(st: &Arc<AppState>, handle: Arc<RepoHandle>) -> GhResult<View> {
     let local = handle.local().clone();
-    let version = handle
-        .manifest_version()
-        .map(|v| v.as_str().to_string())
-        .unwrap_or_default();
+    let version = format!(
+        "{}@{}",
+        handle
+            .manifest_version()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_default(),
+        handle.manifest().head_seq
+    );
     let full_name = handle.id().to_string();
     let index = st
         .caches
