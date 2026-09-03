@@ -19,6 +19,10 @@
 //! - [`repo`] — repository resolution and the read endpoints.
 //! - [`write`] — the write primitive (commit, ref create/update/delete).
 //! - [`error`] — `{message, documentation_url}` with GitHub's statuses.
+//! - [`prs`] — pull requests, reviews, comments and search.
+//! - [`pr_store`] — PR state as JSON in the bucket, written with CAS.
+//! - [`merge`] — real merges (`git merge-tree`) and the PR diff plumbing.
+//! - [`stubs`] — check runs, deployments and statuses (accept-and-forget).
 //! - [`events`] — where a webhook would be produced (a WAL reader, later).
 //! - [`reads`] — trees, blobs, the README, archives, branch protection, and
 //!   the git plumbing the other read modules share.
@@ -30,9 +34,13 @@
 pub mod auth;
 pub mod error;
 pub mod events;
+pub mod merge;
 pub mod models;
+pub mod pr_store;
+pub mod prs;
 pub mod repo;
 pub mod router;
+pub mod stubs;
 pub mod write;
 pub mod reads;
 pub mod contents;

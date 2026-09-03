@@ -62,7 +62,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v3/repos/{owner}/{repo}/commits", get(repo::list_commits))
         .route(
             "/api/v3/repos/{owner}/{repo}/commits/{*ref}",
-            get(repo::get_commit),
+            get(super::prs::commit_or_subroute),
         )
         .route(
             "/api/v3/repos/{owner}/{repo}/branches",
@@ -143,6 +143,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v3/_dev/repos/{owner}/{repo}/protection",
             axum::routing::put(reads::set_protection),
         )
+        .merge(super::prs::routes())
+        .merge(super::stubs::routes())
         .route("/api/graphql", post(super::graphql::handler))
         .route("/api/v3/graphql", post(super::graphql::handler))
         .route("/login/oauth/authorize", get(auth::authorize))
