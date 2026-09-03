@@ -81,7 +81,8 @@ Both GraphQL paths route to one handler. Anything under `/api/v3` that is not ro
 GitHub-shaped 404 rather than falling through to walgit's repo-prefix dispatcher (D26), which would
 otherwise read `api/v3` as `owner = api`, `repo = v3`.
 
-Every response carries `x-ratelimit-{limit,remaining,used,reset,resource}`; clients read those headers
+Every response carries `x-ratelimit-{limit,remaining,used,reset,resource}` and `x-github-request-id`;
+clients read those headers
 rather than calling `/rate_limit`, though `GET /api/v3/rate_limit` answers too.
 
 ## 5. What is implemented

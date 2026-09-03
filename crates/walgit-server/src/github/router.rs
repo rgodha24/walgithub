@@ -109,13 +109,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Every response carries the rate-limit headers a client budgets against.
-/// Nothing here is limited, so the numbers never move.
+/// Every response carries the rate-limit headers a client budgets against
+/// (they are read off responses rather than from `/rate_limit`) and the
+/// request id a client puts in its own error logs. Nothing here is limited,
+/// so the numbers never move.
 async fn rate_limit_headers(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let mut resp = next.run(req).await;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
+        resp.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-github-request-id"),
+            v,
+        );
+    }
     let h = resp.headers_mut();
     for (k, v) in [
         ("x-ratelimit-limit", "1000000"),
