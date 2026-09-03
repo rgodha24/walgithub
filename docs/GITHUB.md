@@ -440,3 +440,10 @@ write through `github::write` verified by a real `git fetch`, and the two fail-c
 when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document in
 `docs/GITHUB_SHAPES.md` §GraphQL verbatim against a pushed repository — including `createCommitOnBranch`,
 whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.
+
+`scripts/github-smoke.mjs` is the client-side check: the real `octokit` package (App JWT →
+installation token, REST, GraphQL) against a running facade. Point it at a server with
+`mintlify/editor-e2e` pushed in (edit `owner`/`repo`/`baseUrl` at the top otherwise), run it from a
+directory whose `node_modules` has `octokit` (`ln -s <app>/node_modules`), and it walks 28 steps:
+reads, `createCommitOnBranch` including the stale-head error, compare, a PR opened, reviewed, commented
+on and merged, `commits/{sha}/pulls`, and a check-run created then patched.
