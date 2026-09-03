@@ -30,6 +30,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
+| `docs/GITHUB.md` | Anyone touching `crates/walgit-server/src/github/*`, or pointing a GitHub-integrated app at walgit for local development. The facade's trust boundary (it has none), URL conventions, the write primitive, known limits. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
 | `docs/patches/README.md` | Git client patches (bundle filter matching) and the gate for advertising filtered bundle families together. |
@@ -399,6 +400,23 @@ decision in §4 — or the PR is; never "fix later".
   + chain) is for clones, **`bundles/catchup`** (no fulls) is what recipes record in `fetch.bundleURI`. Measured: a
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
+
+- **D42 (2026-09-02)** **A GitHub Enterprise Server facade, for local development only, behind
+  `[github] enabled`** (`docs/GITHUB.md`). `/api/v3/*` (REST), `/api/graphql` + `/api/v3/graphql` (both
+  shapes a client emits; parsed, dispatch is a later phase) and `/login/oauth/*` are answered over the same
+  repositories, so an application that already supports GitHub Enterprise Server needs no code to develop
+  against walgit: it points its per-install `baseUrl` at `http://<host>/api/v3`. Repositories are seeded by
+  a plain `git push` to the existing smart HTTP and by nothing else. **The facade is its own trust
+  boundary, and it has none**: every route bypasses `server.auth`, any credential resolves to one
+  hardcoded user, and every permission answer is `admin` — so `Config::validate` refuses `github.enabled`
+  unless `server.auth.mode = "none"` (already loopback-only) or `server.listen` is loopback, and the
+  facade is never deployed. Writes are not a second write path: `github::write` builds objects with `git`
+  plumbing in a scratch object directory over the serving copy's `objects/` (a refused write leaves nothing
+  behind, as with receive-pack's per-ingest scratch dir), packs exactly the new objects, and goes through
+  `ingest_pack` → `publish_push_synced`, so the bucket is the truth and the manifest CAS is still the only
+  commit point. The WAL does not enforce fast-forward, so the facade does it (`merge-base --is-ancestor`,
+  422 without `force`); a ref that moved under a write is a 409. No events are emitted from the write path
+  (principle III): `github::events` is a hook point, and a webhook must come from a WAL reader.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
