@@ -287,7 +287,8 @@ lock_wait_warn = "1s"             # WARN "lock wait" (lock, repo, wait_ms, reque
                                   # /api/v3/*, /api/graphql and /login/oauth/* so an octokit with
                                   # baseUrl = http://<host>/api/v3 reads and writes the bucket. Local development
                                   # only: auth-free by construction (any bearer, one hardcoded user, admin
-                                  # everywhere), so `validate` refuses it unless server.auth.mode = "none" or
-                                  # server.listen is loopback. Node will not trust the self-signed cert, so pair it
+                                  # everywhere), so `validate` requires server.auth.mode = "none" and lets that
+                                  # mode bind beyond loopback (the network is the trust boundary). Node will not
+                                  # trust the self-signed cert, so pair it
                                   # with [server.tls] mode = "off".
 enabled = false

@@ -25,9 +25,9 @@ Every route under `/api/v3`, `/api/graphql` and `/login/oauth` **bypasses `serve
   there is nothing to consent to;
 - the facade is admin on every repository in the bucket, including delete-a-ref.
 
-So the facade is only as safe as the network it is on. `Config::validate` fails closed the way `auth.mode =
-none` does: `github.enabled = true` is refused unless `server.auth.mode = "none"` (itself loopback-only) or
-`server.listen` is a loopback address.
+So the facade is only as safe as the network it is on, and the configuration says so out loud:
+`github.enabled = true` requires `server.auth.mode = "none"`, and with the facade on that mode may bind
+beyond loopback (a compose network, say) — the network the process sits on is the trust boundary.
 
 ## 2. Configuration
 

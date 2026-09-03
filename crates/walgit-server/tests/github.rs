@@ -461,3 +461,13 @@ fn validate_refuses_the_facade_on_a_public_bind() {
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn validate_lets_the_facade_bind_beyond_loopback_with_auth_none() {
+    let mut cfg = walgit_config::Config::default();
+    cfg.store.bucket = "test".into();
+    cfg.github.enabled = true;
+    cfg.server.auth.mode = walgit_config::AuthMode::None;
+    cfg.server.listen = "0.0.0.0:8080".parse().expect("addr");
+    cfg.validate().expect("facade on any bind with auth none");
+}

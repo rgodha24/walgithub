@@ -775,10 +775,9 @@ impl Default for EventsConfig {
 ///
 /// **Local development only.** The facade is auth-free by construction: it
 /// accepts any bearer, reports one hardcoded user with admin on everything and
-/// never consults `server.auth`. `Config::validate` therefore refuses
-/// `enabled = true` unless the process is already open by the same argument —
-/// `server.auth.mode = "none"` (itself loopback-only) or a loopback
-/// `server.listen`.
+/// never consults `server.auth`. `Config::validate` therefore requires
+/// `server.auth.mode = "none"` and, with the facade on, lets that mode bind
+/// beyond loopback: the network the process sits on is the trust boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GithubConfig {
@@ -1489,17 +1488,19 @@ impl Config {
         // any credential and is admin on every repository. Mounting it on a
         // host that is not already open to its network is a way to hand the
         // bucket away, so it fails closed the way `auth.mode = none` does.
+        // With the facade on, the network the process is bound to *is* the
+        // trust boundary (a developer's compose network), so `auth.mode = none`
+        // is the only honest mode and the loopback rule below yields to it.
         if self.github.enabled {
             anyhow::ensure!(
-                self.server.auth.mode == AuthMode::None || self.server.listen.ip().is_loopback(),
-                "github.enabled is auth-free (any bearer is accepted, every repository is admin): it needs server.auth.mode = \"none\" or a loopback server.listen (listen is {}, auth.mode is {:?})",
-                self.server.listen,
+                self.server.auth.mode == AuthMode::None,
+                "github.enabled is auth-free (any bearer is accepted, every repository is admin): it needs server.auth.mode = \"none\" (auth.mode is {:?})",
                 self.server.auth.mode
             );
         }
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
-        if a.mode == AuthMode::None {
+        if a.mode == AuthMode::None && !self.github.enabled {
             anyhow::ensure!(
                 self.server.listen.ip().is_loopback(),
                 "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
