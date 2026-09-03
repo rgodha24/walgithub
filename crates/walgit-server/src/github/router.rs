@@ -28,6 +28,7 @@ use super::error::{FieldError, GhError, GhResult};
 use super::models::{self, Urls};
 use super::repo;
 use super::write;
+use super::{compare, contents, reads};
 use crate::AppState;
 
 /// Mount the facade. Called from `crate::router` only when `github.enabled`.
@@ -69,7 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/v3/repos/{owner}/{repo}/branches/{*branch}",
-            get(repo::get_branch),
+            get(reads::get_branch),
         )
         .route(
             "/api/v3/repos/{owner}/{repo}/git/commits/{sha}",
@@ -92,6 +93,55 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(repo::matching_refs)
                 .patch(update_ref)
                 .delete(delete_ref),
+        )
+        // ---- reads (docs/GITHUB.md §"reads"; added by the read phase, so
+        // they sit at the end of the list rather than in topical order) ----
+        .route(
+            "/api/v3/repos/{owner}/{repo}/git/trees/{*tree_sha}",
+            get(reads::get_tree),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/git/blobs/{sha}",
+            get(reads::get_blob),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/contents",
+            get(contents::get_contents_root),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/contents/{*path}",
+            get(contents::get_contents),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/compare/{*basehead}",
+            get(compare::compare),
+        )
+        .route("/api/v3/repos/{owner}/{repo}/readme", get(reads::get_readme))
+        .route(
+            "/api/v3/repos/{owner}/{repo}/zipball",
+            get(reads::zipball_default),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/zipball/{*ref}",
+            get(reads::zipball),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/tarball",
+            get(reads::tarball_default),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/tarball/{*ref}",
+            get(reads::tarball),
+        )
+        .route(
+            "/api/v3/repos/{owner}/{repo}/rules/branches/{*branch}",
+            get(reads::branch_rules),
+        )
+        // Not GitHub's: the rulesets API is an order of magnitude more surface
+        // than anything reads, so the toggle behind it is set here instead.
+        .route(
+            "/api/v3/_dev/repos/{owner}/{repo}/protection",
+            axum::routing::put(reads::set_protection),
         )
         .route("/api/graphql", post(graphql))
         .route("/api/v3/graphql", post(graphql))

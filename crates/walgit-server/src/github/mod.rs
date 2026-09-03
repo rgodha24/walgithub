@@ -20,6 +20,11 @@
 //! - [`write`] — the write primitive (commit, ref create/update/delete).
 //! - [`error`] — `{message, documentation_url}` with GitHub's statuses.
 //! - [`events`] — where a webhook would be produced (a WAL reader, later).
+//! - [`reads`] — trees, blobs, the README, archives, branch protection, and
+//!   the git plumbing the other read modules share.
+//! - [`contents`] — `contents/{path}` in its four representations.
+//! - [`compare`] — three-dot compare.
+//! - [`diff`] — `files[]`, rendered by `git diff-tree` on the bare repository.
 
 pub mod auth;
 pub mod error;
@@ -28,5 +33,9 @@ pub mod models;
 pub mod repo;
 pub mod router;
 pub mod write;
+pub mod reads;
+pub mod contents;
+pub mod compare;
+pub mod diff;
 
 pub use router::router;
