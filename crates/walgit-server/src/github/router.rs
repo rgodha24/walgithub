@@ -143,8 +143,8 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v3/_dev/repos/{owner}/{repo}/protection",
             axum::routing::put(reads::set_protection),
         )
-        .route("/api/graphql", post(graphql))
-        .route("/api/v3/graphql", post(graphql))
+        .route("/api/graphql", post(super::graphql::handler))
+        .route("/api/v3/graphql", post(super::graphql::handler))
         .route("/login/oauth/authorize", get(auth::authorize))
         .route("/login/oauth/access_token", post(auth::access_token))
         .route(
@@ -271,84 +271,10 @@ fn ref_body(
     )
 }
 
-// ---- graphql -----------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct GraphQlRequest {
-    query: String,
-}
-
-/// The GraphQL endpoint, parsed but not yet dispatched. The next phase fills
-/// in arms keyed on the operation's top-level field; until then every request
-/// is answered with the field it would have needed, so a client's failure
-/// names the gap instead of a transport error.
-async fn graphql(Json(body): Json<GraphQlRequest>) -> Response {
-    let what = top_level_field(&body.query)
-        .unwrap_or_else(|| "unparseable operation".to_string());
-    Json(serde_json::json!({
-        "data": serde_json::Value::Null,
-        "errors": [{ "message": format!("not implemented: {what}") }],
-    }))
-    .into_response()
-}
-
-/// The operation's name plus its first selected field — enough for a dispatch
-/// table and enough for a human reading the error.
-fn top_level_field(query: &str) -> Option<String> {
-    use graphql_parser::query::{Definition, OperationDefinition, Selection};
-    let doc = graphql_parser::parse_query::<&str>(query).ok()?;
-    for def in &doc.definitions {
-        let Definition::Operation(op) = def else {
-            continue;
-        };
-        let (name, set) = match op {
-            OperationDefinition::Query(q) => (q.name, &q.selection_set),
-            OperationDefinition::Mutation(m) => (m.name, &m.selection_set),
-            OperationDefinition::Subscription(s) => (s.name, &s.selection_set),
-            OperationDefinition::SelectionSet(s) => (None, s),
-        };
-        let field = set.items.iter().find_map(|i| match i {
-            Selection::Field(f) => Some(f.name),
-            _ => None,
-        });
-        return Some(match (name, field) {
-            (Some(n), Some(f)) => format!("{n}.{f}"),
-            (None, Some(f)) => f.to_string(),
-            (Some(n), None) => n.to_string(),
-            (None, None) => "anonymous operation".to_string(),
-        });
-    }
-    None
-}
-
 /// A body that is not JSON, or is missing `ref`/`sha`, is GitHub's 422.
 pub fn invalid_body(what: &str) -> GhError {
     GhError::validation(
         "Validation Failed",
         FieldError::invalid("Reference", "ref", what.to_string()),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::top_level_field;
-
-    #[test]
-    fn names_the_operation_and_its_first_field() {
-        assert_eq!(
-            top_level_field("query getLatestCommit($o:String!){ repository { ref { name } } }")
-                .as_deref(),
-            Some("getLatestCommit.repository")
-        );
-        assert_eq!(
-            top_level_field("mutation CreateCommit($i:X!){ createCommitOnBranch(input:$i){ commit { oid } } }")
-                .as_deref(),
-            Some("CreateCommit.createCommitOnBranch")
-        );
-        assert_eq!(
-            top_level_field("{ viewer { login } }").as_deref(),
-            Some("viewer")
-        );
-        assert_eq!(top_level_field("not graphql at all {{{"), None);
-    }
 }

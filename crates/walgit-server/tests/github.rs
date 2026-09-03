@@ -416,7 +416,7 @@ async fn graphql_names_the_field_it_cannot_answer() -> TestResult {
         let body: Value = client()
             .post(format!("{}{path}", s.base_url))
             .json(&serde_json::json!({
-                "query": "query getLatestCommit($o:String!){ repository(owner:$o){ ref { name } } }"
+                "query": "query Whoami { viewer { login } }"
             }))
             .send()
             .await?
@@ -424,7 +424,7 @@ async fn graphql_names_the_field_it_cannot_answer() -> TestResult {
             .await?;
         assert_eq!(
             body["errors"][0]["message"],
-            "not implemented: getLatestCommit.repository",
+            "not implemented: Whoami.viewer",
             "{path}"
         );
     }

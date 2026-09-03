@@ -111,16 +111,14 @@ one object per repository in the bucket (below).
 **Writes** — `POST /api/v3/repos/{o}/{r}/git/refs`, `PATCH` and `DELETE` on `…/git/refs/{ref}`, all on the
 write primitive below.
 
-**GraphQL** — parsed, not dispatched. The operation's name and first top-level field are extracted with
-`graphql-parser` and returned as `{"errors":[{"message":"not implemented: <op>.<field>"}]}`, so a client's
-failure names the gap instead of a transport error. The next phase fills in arms; the parse is already there.
+**GraphQL** — `POST /api/graphql` and `POST /api/v3/graphql`, §10 below.
 
 ## 6. Module map (`crates/walgit-server/src/github/`)
 
 | File | Holds |
 |---|---|
 | `mod.rs` | The module doc and the re-export of `router`. |
-| `router.rs` | Every route, the rate-limit header layer, the `/api/v3` catch-all 404, the ref-write handlers, the GraphQL stub. |
+| `router.rs` | Every route, the rate-limit header layer, the `/api/v3` catch-all 404, the ref-write handlers. |
 | `auth.rs` | The hardcoded user, the installation/token stubs, the OAuth web flow. |
 | `models.rs` | GitHub JSON shapes; `Urls` (origin → `api`/`html`); stable 48-bit `id`s and `node_id`s derived from names. |
 | `repo.rs` | `{owner}/{repo}` → a synced `RepoHandle`, the ref index, ref resolution, and the read handlers. |
@@ -131,9 +129,10 @@ failure names the gap instead of a transport error. The next phase fills in arms
 | `contents.rs` | `contents/{path}` in its four representations, plus `entry_type`/`entry_json`/`file_json`/`file_response`. |
 | `compare.rs` | Three-dot compare. |
 | `diff.rs` | `FileChange` and `changed_files`/`file_json` — `files[]` rendered by `git diff-tree`. |
+| `graphql/` | `POST /graphql`: `parse.rs` (document → field tree), `ops.rs` (queries), `mutate.rs` (mutations), `blame.rs`, `prs.rs` (PR JSON in the bucket), `error.rs` (GitHub's error `type`s). |
 
-Later phases slot in beside these: a `prs.rs` (PR state as JSON under the repository's prefix in the
-bucket) and dispatch arms inside `router::graphql`.
+Later phases slot in beside these: a `prs.rs` (the REST pulls endpoints over the JSON `graphql/prs.rs`
+already writes).
 
 ## 6a. The read surface in detail
 
@@ -247,5 +246,106 @@ end to end.
 
 `crates/walgit-server/tests/github.rs` boots a server on the in-memory store, pushes a real repository with
 real `git`, then exercises the auth stubs, the OAuth flow, every read shape, ref create/update/delete, a
-write through `github::write` verified by a real `git fetch`, the GraphQL stub, and the two fail-closed
-paths (facade absent when disabled, `validate` refusing a public bind). It is in `just test`.
+write through `github::write` verified by a real `git fetch`, and the two fail-closed paths (facade absent
+when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document in
+`docs/GITHUB_SHAPES.md` §GraphQL verbatim against a pushed repository — including `createCommitOnBranch`,
+whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.
+
+## 10. GraphQL
+
+`POST /api/graphql` and `POST /api/v3/graphql` are one handler, and there is **no GraphQL engine behind
+it**. Every document a client sends is a string literal in its own source — `docs/GITHUB_SHAPES.md`
+("POST /graphql") lists all of them, their variables and the exact fields destructured off the answer — so
+the handler parses the document with `graphql-parser`, takes its single operation, resolves each argument
+against the JSON `variables`, and dispatches on field names. A schema, a resolver graph and an executor
+would be a large amount of machinery to answer eleven known questions.
+
+Served today:
+
+| Document | Answers with |
+|---|---|
+| `repository { ref(qualifiedName) { target { … history(first) } } }` | the branch tip, `git log` from it |
+| `repository { object(expression: "<rev>:<path>") { … on Blob } }` | `oid`, `byteSize`, `isBinary`, `text` |
+| `repository { refs(refPrefix, first, after, query) }` | the branch listing, one page per call |
+| `repository { ref { target { blame(path) { ranges } } } }` | `git blame --porcelain` |
+| `repositoryOwner(login) { repositories(first, after, orderBy) }` | every repository of that owner in the bucket |
+| `search(query, type: REPOSITORY, first)` | the same listing, filtered by the search string |
+| `mutation createCommitOnBranch(input)` | a commit through `write::commit_on_ref` |
+| `mutation markPullRequestReadyForReview(input)` / `convertPullRequestToDraft(input)` | `draft` on the PR JSON |
+| `mutation addPullRequestReviewThread(input)` | a thread appended to the PR JSON |
+
+Conventions, all of them the call sites':
+
+- **Every answer is HTTP 200**, including every error — GitHub's is too, and the client turns a non-empty
+  `errors[]` into a `GraphqlResponseError` reading only `errors[0].type` and `errors[0].message`.
+- **Error `type`s are GitHub's**, because `createCommitOnBranch` branches on them: `NOT_FOUND` → 404
+  (a message containing `Could not resolve to a Repository` gets its own summary), `STALE_DATA` → 412,
+  everything else → 500. An `expectedHeadOid` that is not where the branch is answers `UNPROCESSABLE` with
+  `Expected branch to point to "<oid>" but it did not.`; a ref that moves between that check and the CAS
+  answers `STALE_DATA`. **Neither is an HTTP 409** — over GraphQL a status is not how a client is told.
+- **A field that is not served** is `{"data":null,"errors":[{"type":"NOT_IMPLEMENTED","message":"not
+  implemented: <operation>.<field path>"}]}`, so a gap names itself.
+- **Missing things follow the call site**: a repository that does not resolve is a `NOT_FOUND` error, a
+  `ref` that is not there is `null` (the caller falls back to REST), and `object` is `null` for every miss
+  (the caller swallows errors to `null`, so a miss must not look like an outage).
+- Each arm answers the **full** shape of its node, not only the selected fields — the documents are
+  literals that get edited — but selection still decides work: `history` and `blame` are computed only when
+  they are asked for.
+- `x-ratelimit-remaining` is never `0`: a zero makes the client sleep `retry-after + 1` seconds (61 by
+  default) and retry once.
+
+Known limits: a cursor is an offset, not a snapshot, so a page taken across a concurrent push can skip or
+repeat a row; `search` matches the free terms against the repository *name* only; every addition is
+committed at mode `100644` (an executable file rewritten through the editor loses its bit); and
+`repositoryOwner` resolves the owner's whole listing before paging it (a developer's bucket, not a
+monorepo host's).
+
+## 11. Pull request state in the bucket
+
+The GraphQL mutations that only flip `draft` or append a review thread need somewhere durable to write
+before the REST pulls endpoints exist, and it must be the place those endpoints will read. The layout is
+therefore fixed here, under the repository's own prefix (`RepoId::store_prefix()` =
+`repos/<owner>/<repo>/`):
+
+- `github/prs/<n>.json` — one pull request. **The unit of CAS**: every mutation is read → modify →
+  `PutMode::Update(version)`, retried on a lost race.
+- `github/prs/index.json` — `{next_number, numbers: [...]}`, so allocating a number is one CAS and a
+  listing is not a LIST.
+
+```json
+{
+  "number": 412,
+  "node_id": "UFJfYWNtZS9kb2NzIzQxMg==",
+  "title": "Docs: add quickstart",
+  "body": "",
+  "state": "open",
+  "draft": false,
+  "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" },
+  "head": { "ref": "editor/quickstart", "sha": "2222222222222222222222222222222222222222" },
+  "user": "mintlify-dev",
+  "created_at": "2026-08-30T09:00:00Z",
+  "updated_at": "2026-08-30T10:16:00Z",
+  "merged": false,
+  "merged_at": null,
+  "merge_commit_sha": null,
+  "html_url": "http://127.0.0.1:8080/acme/docs/pull/412",
+  "review_threads": []
+}
+```
+
+Unknown keys survive a round trip (they are kept in a flattened `extra`), so a REST handler may add
+fields — `commits`, `additions`, `changed_files` — without this module dropping them.
+
+**Node ids.** GitHub's are opaque base64 and no client parses one, so the facade's are base64 of a
+readable body and round-trip exactly:
+
+| Kind | Body | Example |
+|---|---|---|
+| pull request | `PR_<owner>/<repo>#<number>` | `PR_acme/docs#412` |
+| pending review | `PRR_<owner>/<repo>#<number>#<review id>` | `PRR_acme/docs#412#7` |
+| review thread | `PRRT_<owner>/<repo>#<number>#<ordinal>` | `PRRT_acme/docs#412#1` |
+
+`markPullRequestReadyForReview` and `convertPullRequestToDraft` are handed the first;
+`addPullRequestReviewThread` is handed the second (the `node_id` of the pending review the client opened
+over REST) and answers the third. `POST /pulls/{n}/reviews` must therefore mint its `node_id` this way, or
+the mutation cannot find the pull request the review belongs to.

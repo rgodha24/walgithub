@@ -25,6 +25,7 @@
 //! - [`contents`] — `contents/{path}` in its four representations.
 //! - [`compare`] — three-dot compare.
 //! - [`diff`] — `files[]`, rendered by `git diff-tree` on the bare repository.
+//! - [`graphql`] — `POST /api/graphql`, dispatched on field names.
 
 pub mod auth;
 pub mod error;
@@ -37,5 +38,6 @@ pub mod reads;
 pub mod contents;
 pub mod compare;
 pub mod diff;
+pub mod graphql;
 
 pub use router::router;
