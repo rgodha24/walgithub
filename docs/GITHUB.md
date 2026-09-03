@@ -85,47 +85,29 @@ Every response carries `x-ratelimit-{limit,remaining,used,reset,resource}` and `
 clients read those headers
 rather than calling `/rate_limit`, though `GET /api/v3/rate_limit` answers too.
 
-## 5. What is implemented
+## 5. Endpoint coverage
 
-**Identity and installation** — `GET /api/v3/user`, `GET /api/v3/users/{login}`,
-`GET /api/v3/user/installations`, `GET /api/v3/app`, `GET /api/v3/app/installations`,
-`GET|DELETE /api/v3/app/installations/{id}`, `POST /api/v3/app/installations/{id}/access_tokens`,
-`GET /api/v3/installation/repositories`, `GET /api/v3/rate_limit`,
-`DELETE /api/v3/applications/{client_id}/{grant,token}`,
-`GET /api/v3/repos/{o}/{r}/collaborators/{u}/permission`, `GET /login/oauth/authorize`,
-`POST /login/oauth/access_token`.
+Every route the facade answers, and what stands behind it. Anything under `/api/v3` that is not in this
+table is a GitHub-shaped 404, never a fall-through to walgit's repo-prefix dispatcher.
 
-**Reads** — `GET /api/v3/repos/{o}/{r}`, `…/commits` (`?sha=`, `?path=`), `…/commits/{ref}` (branch, tag
-or sha), `…/git/commits/{sha}`, `…/branches`, `…/branches/{branch}`, `…/git/ref/{ref}`,
-`…/git/refs[/{ref}]`, `…/git/matching-refs/{ref}`. Listings carry a `Link` header
-(`next`/`prev`/`first`; no `last`, which would mean walking a whole history).
+| Surface | Endpoints | Behind it |
+|---|---|---|
+| Identity | `GET /api/v3/user`, `…/users/{login}`, `…/user/installations`, `…/app`, `…/app/installations`, `GET\|DELETE …/app/installations/{id}`, `POST …/app/installations/{id}/access_tokens`, `…/installation/repositories`, `…/rate_limit`, `DELETE …/applications/{client_id}/{grant,token}`, `…/repos/{o}/{r}/collaborators/{u}/permission` | `auth.rs`: one hardcoded user, every permission `admin` |
+| OAuth | `GET /login/oauth/authorize`, `POST /login/oauth/access_token` | `auth.rs`: the web flow agrees immediately |
+| Ref reads | `GET …/repos/{o}/{r}`, `…/commits` (`?sha=`, `?path=`), `…/commits/{ref}`, `…/git/commits/{sha}`, `…/branches`, `…/branches/{branch}`, `…/git/ref/{ref}`, `…/git/refs[/{ref}]`, `…/git/matching-refs/{ref}` | `repo.rs` on the ref snapshot; listings carry `Link` (`next`/`prev`/`first`, never `last`) |
+| Object reads | `GET …/git/trees/{sha}` (`?recursive=`), `…/git/blobs/{sha}`, `…/contents[/{path}]` (`?ref=`), `…/compare/{base}...{head}`, `…/readme` (`?ref=`), `…/zipball[/{ref}]`, `…/tarball[/{ref}]` | `reads.rs`, `contents.rs`, `compare.rs`, `diff.rs` — stock `git` on the **bare** serving copy |
+| Branch protection | `GET …/rules/branches/{branch}`, `…/branches/{branch}/protection`, `PUT …/_dev/repos/{o}/{r}/protection` | `reads.rs` over one `github/protection.json` per repository (§6a) |
+| Ref writes | `POST …/git/refs`, `PATCH\|DELETE …/git/refs/{ref}` | `write.rs`, walgit's publish path (§7) |
+| Pull requests | `POST\|GET …/pulls`, `GET\|PATCH …/pulls/{n}`, `…/pulls/{n}/{files,commits,merge,reviews,comments,requested_reviewers}`, `…/pulls/{n}/reviews/{id}[/events]`, `GET\|POST …/issues/{n}/comments`, `GET\|PATCH\|DELETE …/issues/comments/{id}`, reactions on both comment kinds, `GET …/issues/{n}`, `GET …/commits/{sha}/pulls`, `POST …/merges`, `POST /repos/{t}/{t}/generate`, `GET /search/issues` | `prs.rs` + `pr_store.rs` + `merge.rs` (§9) |
+| Accept-and-forget | `POST …/check-runs`, `GET\|PATCH …/check-runs/{id}`, `GET …/commits/{ref}/check-runs`, `POST\|GET …/deployments`, `POST\|GET …/deployments/{id}/statuses`, `POST …/statuses/{sha}`, `GET …/commits/{ref}/{status,statuses}` | `stubs.rs`: a bounded in-memory map, forgotten on restart — every one is a write whose response is read once, for an `id` |
+| GraphQL | `POST /api/graphql`, `POST /api/v3/graphql` | `graphql/`, dispatched on field names (§10) |
 
-**Object reads** — `…/git/trees/{sha}` (`?recursive=`), `…/git/blobs/{sha}`, `…/contents[/{path}]`
-(`?ref=`), `…/compare/{base}...{head}`, `…/readme` (`?ref=`), `…/zipball[/{ref}]`, `…/tarball[/{ref}]`.
-Everything renders through stock `git` on the **bare** serving copy — `ls-tree`, `cat-file`, `diff-tree`
-and `archive` all work without a work tree, so the scratch checkout §8 predicted was never needed.
+Two routes are catch-alls carrying a dispatcher, because matchit refuses a path parameter beside a
+catch-all and both a branch name and a ref may contain `/`:
 
-**Branch protection** — `…/rules/branches/{branch}` and `…/branches/{branch}/protection`, both driven by
-one object per repository in the bucket (below).
-
-**Writes** — `POST /api/v3/repos/{o}/{r}/git/refs`, `PATCH` and `DELETE` on `…/git/refs/{ref}`, all on the
-write primitive below.
-
-**Pull requests** (§11) — `POST|GET /repos/{o}/{r}/pulls`, `GET|PATCH …/pulls/{n}`,
-`…/pulls/{n}/{files,commits,merge,reviews,comments,requested_reviewers}`,
-`…/pulls/{n}/reviews/{id}[/events]`, `GET|POST /repos/{o}/{r}/issues/{n}/comments`,
-`GET|PATCH|DELETE …/issues/comments/{id}`, reactions on both comment kinds,
-`GET …/issues/{n}`, `GET …/commits/{sha}/pulls`, `POST …/merges`,
-`POST /repos/{t}/{t}/generate`, `GET /search/issues`.
-
-**Accept-and-forget** — `POST …/check-runs`, `GET|PATCH …/check-runs/{id}`,
-`GET …/commits/{ref}/check-runs`, `POST|GET …/deployments`,
-`POST|GET …/deployments/{id}/statuses`, `POST …/statuses/{sha}`,
-`GET …/commits/{ref}/{status,statuses}`. These keep a bounded
-in-memory map and nothing else: every one of them is a write whose response is read once, for an
-`id`, and then only written back to.
-
-**GraphQL** — `POST /api/graphql` and `POST /api/v3/graphql`, §10 below.
+- `commits/{*ref}` → `prs::commit_or_subroute`, which peels `/pulls`, `/check-runs`, `/status` and
+  `/statuses` off the tail and otherwise answers the commit shape.
+- `branches/{*branch}` → `reads::get_branch`, which peels `/protection` off the tail.
 
 ## 6. Module map (`crates/walgit-server/src/github/`)
 
@@ -135,19 +117,19 @@ in-memory map and nothing else: every one of them is a write whose response is r
 | `router.rs` | Every route, the rate-limit header layer, the `/api/v3` catch-all 404, the ref-write handlers. |
 | `auth.rs` | The hardcoded user, the installation/token stubs, the OAuth web flow. |
 | `models.rs` | GitHub JSON shapes; `Urls` (origin → `api`/`html`); stable 48-bit `id`s and `node_id`s derived from names. |
-| `repo.rs` | `{owner}/{repo}` → a synced `RepoHandle`, the ref index, ref resolution, and the read handlers. |
-| `write.rs` | The write primitive. |
+| `repo.rs` | `{owner}/{repo}` → a synced `RepoHandle`, the ref index, ref resolution, the repository/commit/branch/ref handlers — and the git plumbing every other module shares: `git`, `LOG_FORMAT`, `parse_commits`, `commit_facts`, `merge_base`, `commit_count`, `commits_between`. |
+| `write.rs` | The write primitive, and `Scratch` — the scratch object directory `merge.rs` builds on too. |
 | `prs.rs` | Pull requests, reviews, comments, reactions, issues and search. |
 | `pr_store.rs` | PR state as JSON in the bucket, written with CAS. |
-| `merge.rs` | `git merge-tree` merges, the PR diff plumbing, `generate`. |
+| `merge.rs` | `git merge-tree` merges (merge, squash, rebase), publishing, and `generate`. |
 | `stubs.rs` | Check runs, deployments and statuses (accept-and-forget). |
 | `error.rs` | `{message, documentation_url}` (+ `errors[]` on a 422) with GitHub's statuses. |
 | `events.rs` | The hook point where a webhook would be produced. |
-| `reads.rs` | Trees, blobs, the README, archives, branch protection — and the git plumbing (`git`, `ls_tree`, `commit_facts`, `parse_commits`, `base64_github`, `wants_raw`, `resolve_ref`) the other read modules share. |
+| `reads.rs` | Trees, blobs, the README, archives, branch protection, and `ls_tree`/`base64_github`/`wants_raw`/`resolve_ref`. |
 | `contents.rs` | `contents/{path}` in its four representations, plus `entry_type`/`entry_json`/`file_json`/`file_response`. |
 | `compare.rs` | Three-dot compare. |
-| `diff.rs` | `FileChange` and `changed_files`/`file_json` — `files[]` rendered by `git diff-tree`. |
-| `graphql/` | `POST /graphql`: `parse.rs` (document → field tree), `ops.rs` (queries), `mutate.rs` (mutations), `blame.rs`, `prs.rs` (PR JSON in the bucket), `error.rs` (GitHub's error `type`s). |
+| `diff.rs` | The only `files[]` renderer: `FileChange`, `changed_files`, `stats`, `file_json`, all `git diff-tree` on the bare copy. Compare and `pulls/{n}/files` are the same three passes. |
+| `graphql/` | `POST /graphql`: `parse.rs` (document → field tree), `ops.rs` (queries), `mutate.rs` (mutations), `blame.rs`, `error.rs` (GitHub's error `type`s). PR state is `pr_store.rs`'s, not a second copy. |
 
 ## 6a. The read surface in detail
 
@@ -225,7 +207,7 @@ Semantics worth knowing:
 - **No blocking on a tokio worker.** Every `git` call is `tokio::process`; the tempdir is created under
   `spawn_blocking`.
 
-## 8. Known limits (read this before the next phase)
+## 8. Known limits (one list, all three phases)
 
 - **Object reads need the packs locally.** `repo::objects_view` refuses with **503** when
   `sync_objects()` hands back `ObjectAccess::Remote` — the facade renders through stock `git` against the
@@ -251,6 +233,41 @@ Semantics worth knowing:
 - **The facade produces no events.** `events.rs` is a hook point only. Principle III: a webhook must be a
   reader of the WAL from a durable cursor (`crate::bridge`, `docs/EVENTS.md`), never a step of a write.
 
+Reads:
+
+- **An archive is a 200, not a 302.** GitHub redirects `zipball`/`tarball` to codeload; walgit streams
+  `git archive` on the first response instead. Both callers read `response.data` as an `ArrayBuffer` and
+  the tarball caller follows redirects, so a body on the first response is what they end up with either
+  way — and it saves inventing a second origin that has to be reachable.
+- **A branch literally named `<x>/protection` is unreachable.** `branches/{*branch}` is a catch-all
+  (branch names contain `/`), so `/protection` is dispatched off the tail inside the handler; a branch
+  whose own name ends that way is read as the protection sub-route.
+- **A compare cursor is a page of an offset, not a snapshot.** Pagination follows GitHub's caps rather
+  than its `per_page` default: ≤ 250 commits and ≤ 300 files, and *no* `per_page` means both caps.
+
+Pull requests:
+
+- **`POST /generate` copies the template's default branch only.** `include_all_branches` is accepted and
+  ignored.
+- **A squash commit's body is the PR body**, not the concatenation of the squashed commits' messages,
+  which is what GitHub composes.
+- **A PR's index row and its object are two puts.** The object lands first and the row is refreshed
+  after, so a crash between them leaves a row one edit stale. The object is the truth; every read that
+  needs precision reads it, and the next write repairs the row.
+- **There are no forks**, so `head.repo` is never `null` and an `owner:branch` filter ignores the owner.
+- **`GET /pulls/{n}` computes `mergeable` with a real `merge-tree` on every read.** Correct, and one
+  subprocess per read.
+
+GraphQL:
+
+- **Every addition is committed at mode `100644`** — an executable file rewritten through the editor
+  loses its bit. `createCommitOnBranch` carries no mode and the facade invents none.
+- **A `repositories`/`refs`/`search` cursor is an offset, not a snapshot**, so a page taken across a
+  concurrent push can skip or repeat a row.
+- **`search` matches the free terms against the repository *name* only.**
+- **`repositoryOwner` resolves the owner's whole listing before paging it** — a developer's bucket, not
+  a monorepo host's.
+
 ## 9. Pull requests
 
 ### 9.1 Storage layout
@@ -262,8 +279,8 @@ scoped to):
 
 | Key | Holds |
 |---|---|
-| `github/prs/index.json` | `{next_number, prs: [row]}` — the listing. |
-| `github/prs/<n>.json` | One PR: title, body, state, draft, base/head, comments, reviews, review comments, review threads. |
+| `github/prs/index.json` | `{next_number, prs: [row]}` — the listing, and the PR-number allocator. |
+| `github/prs/<n>.json` | One PR, and the unit of CAS: title, body, state, draft, base/head, comments, reviews, review comments, review threads. |
 
 A row is `{number, state, draft, merged, head_ref, base_ref, head_sha, merge_commit_sha,
 created_at, updated_at}` — everything `GET /pulls` filters or sorts on, and everything
@@ -278,11 +295,58 @@ Editing one writes the object and then refreshes its row, which is two puts and 
 — a crash between them leaves a row one edit stale, and every read that needs precision reads the
 object. The object is the truth; the index is a cache of it.
 
-`node_id` is base64 of `PR_<owner>/<repo>#<n>` (so `PR_acme/docs#412` →
-`UFJfYWNtZS9kb2NzIzQxMg==`), stable across restarts and instances the way every other id here is.
 Comment, review and reaction ids come from a counter in the PR JSON, offset by the PR number
 (`number * 1_000_000 + k`), so an id names the PR it belongs to and
 `PATCH /issues/comments/{id}` needs no scan.
+
+**Node ids.** GitHub's are opaque base64 and no client parses one, so the facade's are base64 of a
+readable body and round-trip exactly. `pr_store::NodeId` mints and parses all three:
+
+| Kind | Body | Example |
+|---|---|---|
+| pull request | `PR_<owner>/<repo>#<number>` | `PR_acme/docs#412` → `UFJfYWNtZS9kb2NzIzQxMg==` |
+| review | `PRR_<owner>/<repo>#<number>#<review id>` | `PRR_acme/docs#412#412000001` |
+| review thread | `PRRT_<owner>/<repo>#<number>#<ordinal>` | `PRRT_acme/docs#412#1` |
+
+The second is the seam between the two surfaces: `POST /pulls/{n}/reviews` mints it, and GraphQL's
+`addPullRequestReviewThread` is handed exactly that id and resolves the pull request out of it. It
+carries the PR number for that reason — an id naming only the review would be unresolvable. The
+mutation answers the third; `markPullRequestReadyForReview` and `convertPullRequestToDraft` take the
+first. `github_graphql.rs` walks the whole seam in one test.
+
+One PR object, in full:
+
+```json
+{
+  "number": 412,
+  "node_id": "UFJfYWNtZS9kb2NzIzQxMg==",
+  "title": "Docs: add quickstart",
+  "body": "",
+  "state": "open",
+  "draft": false,
+  "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" },
+  "head": { "ref": "editor/quickstart", "sha": "2222222222222222222222222222222222222222" },
+  "user": "mintlify-dev",
+  "created_at": "2026-08-30T09:00:00Z",
+  "updated_at": "2026-08-30T10:16:00Z",
+  "closed_at": null,
+  "merged": false,
+  "merged_at": null,
+  "merge_commit_sha": null,
+  "html_url": "http://127.0.0.1:8080/acme/docs/pull/412",
+  "labels": [],
+  "comments": [],
+  "reviews": [],
+  "review_comments": [],
+  "review_threads": [],
+  "maintainer_can_modify": true,
+  "next_id": 412000001
+}
+```
+
+Every field added since is `#[serde(default)]`, so an object written by an older build still parses.
+`pr_store::PullRequest` is the one definition of this shape — the GraphQL arms read and write the same
+struct, so a field is added once or not at all.
 
 `head.sha` is **not** authoritative while a PR is open: it is re-resolved from `refs/heads/<head>`
 on every read, so a PR always reports the branch's current tip. It freezes at the value the branch
@@ -310,38 +374,6 @@ between ` inside `errors[].message` from `POST /pulls`.
 
 The base ref's expected old value travels into the WAL transaction, so a base that moves between the
 merge-tree and the publish is a conflict rather than a lost update.
-
-### 9.3 Known limits
-
-- `POST /generate` copies the template's **default branch only**; `include_all_branches` is accepted
-  and ignored.
-- There are no forks, so `head.repo` is never `null` and `owner:branch` filters ignore the owner.
-- `GET /pulls/{n}` computes `mergeable` with a real `merge-tree` on every read. Correct, and one
-  subprocess per read.
-- `commits/{sha}/pulls`, `commits/{ref}/check-runs` and `commits/{ref}/status` are dispatched off
-  the tail of the `commits/{*ref}` route rather than being routes of their own: matchit refuses to
-  register a path parameter beside a catch-all.
-
-## 10. Testing
-
-`crates/walgit-server/tests/github_prs.rs` covers the PR flow: open/duplicate/no-commits-between,
-list and filter, files with a rename, merge/squash/rebase each verified by a real `git fetch` of the
-base, a conflict (405) and a stale head (409), comments/reviews/reactions, `commits/{sha}/pulls`,
-`POST /merges`, template generation, concurrent check-run PATCHes, and a second instance over the
-same bucket reading a PR the first one wrote.
-
-`crates/walgit-server/tests/github_reads.rs` covers the read surface: trees in both modes, blobs as JSON
-and as raw bytes, `contents` as a directory / a file / raw / `object+json` / 404, compare (ahead with a
-rename and a binary file, diverged, identical, `owner:branch`), the README in both representations, a
-zipball whose listing is checked with `unzip -l` and a gzip-magic tarball, and the protection toggle
-end to end.
-
-`crates/walgit-server/tests/github.rs` boots a server on the in-memory store, pushes a real repository with
-real `git`, then exercises the auth stubs, the OAuth flow, every read shape, ref create/update/delete, a
-write through `github::write` verified by a real `git fetch`, and the two fail-closed paths (facade absent
-when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document in
-`docs/GITHUB_SHAPES.md` §GraphQL verbatim against a pushed repository — including `createCommitOnBranch`,
-whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.
 
 ## 10. GraphQL
 
@@ -386,58 +418,25 @@ Conventions, all of them the call sites':
 - `x-ratelimit-remaining` is never `0`: a zero makes the client sleep `retry-after + 1` seconds (61 by
   default) and retry once.
 
-Known limits: a cursor is an offset, not a snapshot, so a page taken across a concurrent push can skip or
-repeat a row; `search` matches the free terms against the repository *name* only; every addition is
-committed at mode `100644` (an executable file rewritten through the editor loses its bit); and
-`repositoryOwner` resolves the owner's whole listing before paging it (a developer's bucket, not a
-monorepo host's).
+Known limits are in §8 with everything else's.
 
-## 11. Pull request state in the bucket
+## 11. Testing
 
-The GraphQL mutations that only flip `draft` or append a review thread need somewhere durable to write
-before the REST pulls endpoints exist, and it must be the place those endpoints will read. The layout is
-therefore fixed here, under the repository's own prefix (`RepoId::store_prefix()` =
-`repos/<owner>/<repo>/`):
+`crates/walgit-server/tests/github_prs.rs` covers the PR flow: open/duplicate/no-commits-between,
+list and filter, files with a rename, merge/squash/rebase each verified by a real `git fetch` of the
+base, a conflict (405) and a stale head (409), comments/reviews/reactions, `commits/{sha}/pulls`,
+`POST /merges`, template generation, concurrent check-run PATCHes, and a second instance over the
+same bucket reading a PR the first one wrote.
 
-- `github/prs/<n>.json` — one pull request. **The unit of CAS**: every mutation is read → modify →
-  `PutMode::Update(version)`, retried on a lost race.
-- `github/prs/index.json` — `{next_number, numbers: [...]}`, so allocating a number is one CAS and a
-  listing is not a LIST.
+`crates/walgit-server/tests/github_reads.rs` covers the read surface: trees in both modes, blobs as JSON
+and as raw bytes, `contents` as a directory / a file / raw / `object+json` / 404, compare (ahead with a
+rename and a binary file, diverged, identical, `owner:branch`), the README in both representations, a
+zipball whose listing is checked with `unzip -l` and a gzip-magic tarball, and the protection toggle
+end to end.
 
-```json
-{
-  "number": 412,
-  "node_id": "UFJfYWNtZS9kb2NzIzQxMg==",
-  "title": "Docs: add quickstart",
-  "body": "",
-  "state": "open",
-  "draft": false,
-  "base": { "ref": "main", "sha": "1111111111111111111111111111111111111111" },
-  "head": { "ref": "editor/quickstart", "sha": "2222222222222222222222222222222222222222" },
-  "user": "mintlify-dev",
-  "created_at": "2026-08-30T09:00:00Z",
-  "updated_at": "2026-08-30T10:16:00Z",
-  "merged": false,
-  "merged_at": null,
-  "merge_commit_sha": null,
-  "html_url": "http://127.0.0.1:8080/acme/docs/pull/412",
-  "review_threads": []
-}
-```
-
-Unknown keys survive a round trip (they are kept in a flattened `extra`), so a REST handler may add
-fields — `commits`, `additions`, `changed_files` — without this module dropping them.
-
-**Node ids.** GitHub's are opaque base64 and no client parses one, so the facade's are base64 of a
-readable body and round-trip exactly:
-
-| Kind | Body | Example |
-|---|---|---|
-| pull request | `PR_<owner>/<repo>#<number>` | `PR_acme/docs#412` |
-| pending review | `PRR_<owner>/<repo>#<number>#<review id>` | `PRR_acme/docs#412#7` |
-| review thread | `PRRT_<owner>/<repo>#<number>#<ordinal>` | `PRRT_acme/docs#412#1` |
-
-`markPullRequestReadyForReview` and `convertPullRequestToDraft` are handed the first;
-`addPullRequestReviewThread` is handed the second (the `node_id` of the pending review the client opened
-over REST) and answers the third. `POST /pulls/{n}/reviews` must therefore mint its `node_id` this way, or
-the mutation cannot find the pull request the review belongs to.
+`crates/walgit-server/tests/github.rs` boots a server on the in-memory store, pushes a real repository with
+real `git`, then exercises the auth stubs, the OAuth flow, every read shape, ref create/update/delete, a
+write through `github::write` verified by a real `git fetch`, and the two fail-closed paths (facade absent
+when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document in
+`docs/GITHUB_SHAPES.md` §GraphQL verbatim against a pushed repository — including `createCommitOnBranch`,
+whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.

@@ -417,6 +417,15 @@ decision in §4 — or the PR is; never "fix later".
   commit point. The WAL does not enforce fast-forward, so the facade does it (`merge-base --is-ancestor`,
   422 without `force`); a ref that moved under a write is a 409. No events are emitted from the write path
   (principle III): `github::events` is a hook point, and a webhook must come from a WAL reader.
+  **(2026-09-03)** The three phases D42 planned have landed and two of its clauses have moved on.
+  GraphQL is no longer "parsed, dispatch is a later phase": `github/graphql/` dispatches on field names
+  against a hand-written arm per document, with no schema or executor, and an unserved field answers
+  `NOT_IMPLEMENTED` at HTTP 200. And the facade now owns durable state git cannot hold — pull requests,
+  as JSON under the repository's own prefix (`github/prs/index.json` + `github/prs/<n>.json`, CAS on
+  both) and one branch-protection object (`github/protection.json`). That state is the facade's alone:
+  it is not WAL, not replayed, and nothing outside `github/` reads it, so it does not widen the bucket
+  contract §2 defines. Everything else in D42 stands — the trust boundary, the `validate` refusal, and
+  writes going through `ingest_pack` → `publish_push_synced` and no second path, merges included.
 
 Decision identifiers are stable; gaps in the numbering are intentional.
 
