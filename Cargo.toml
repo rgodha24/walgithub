@@ -145,6 +145,9 @@ pin-project-lite = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 base64 = "0.22"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+# The GitHub facade parses a GraphQL operation only to name it in the
+# not-implemented error (docs/GITHUB.md); no execution, no schema.
+graphql-parser = "0.4"
 libc = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
