@@ -297,7 +297,17 @@ pub fn file_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_numstat, apply_patches, parse_raw};
+    use super::{apply_numstat, apply_patches, parse_raw, status_of};
+
+    #[test]
+    fn status_letters_map_to_githubs_words() {
+        assert_eq!(status_of("A"), "added");
+        assert_eq!(status_of("D"), "removed");
+        assert_eq!(status_of("R100"), "renamed");
+        assert_eq!(status_of("C90"), "copied");
+        assert_eq!(status_of("T"), "changed");
+        assert_eq!(status_of("X"), "modified");
+    }
 
     const RAW: &str = ":100644 100644 9b69328 9b69328 R100\0README.md\0READ2.md\0:000000 100644 0000000000000000000000000000000000000000 d4f30d3 A\0bin.dat\0:100644 100644 de98044 a7bc997 M\0pages/index.mdx\0";
 

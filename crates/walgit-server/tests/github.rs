@@ -409,6 +409,53 @@ async fn a_write_lands_in_the_bucket_and_a_real_fetch_sees_it() -> TestResult {
     Ok(())
 }
 
+/// Two catch-alls carry a dispatcher each — `commits/{*ref}` peels
+/// `/pulls`, `/check-runs`, `/status` and `/statuses` off the tail, and
+/// `branches/{*branch}` peels `/protection`. matchit panics at construction
+/// on a route conflict, so a server that answers at all is half the
+/// assertion; the other half is that the plain shapes still come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn both_catch_all_dispatchers_keep_their_plain_shapes() -> TestResult {
+    let s = server().await?;
+    let (_tmp, head) = fixture(&s)?;
+
+    // `commits/{ref}` in all three of its spellings.
+    for r in [head.as_str(), "main", "v1"] {
+        let c = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{r}")).await?;
+        assert!(c["sha"].as_str().is_some_and(|v| !v.is_empty()), "{r}: {c}");
+        assert!(c["commit"]["author"]["date"].is_string(), "{r}: {c}");
+    }
+
+    // The listing, and the listing filtered by path.
+    let all = ok(&s, "/api/v3/repos/acme/docs/commits").await?;
+    assert_eq!(all.as_array().map(Vec::len), Some(2), "{all}");
+    let filtered = ok(&s, "/api/v3/repos/acme/docs/commits?path=pages/index.mdx").await?;
+    assert_eq!(filtered.as_array().map(Vec::len), Some(1), "{filtered}");
+    assert_eq!(filtered[0]["sha"], Value::from(head.clone()));
+
+    // The four sub-routes off a commit.
+    let pulls = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/pulls")).await?;
+    assert_eq!(pulls, Value::Array(Vec::new()), "{pulls}");
+    let runs = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/check-runs")).await?;
+    assert_eq!(runs["total_count"], 0, "{runs}");
+    let status = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/status")).await?;
+    assert_eq!(status["state"], "success", "{status}");
+    let statuses = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/statuses")).await?;
+    assert_eq!(statuses, Value::Array(Vec::new()), "{statuses}");
+
+    // `branches/{branch}` and the `/protection` its own catch-all dispatches.
+    let branch = ok(&s, "/api/v3/repos/acme/docs/branches/main").await?;
+    assert_eq!(branch["name"], "main");
+    assert_eq!(branch["commit"]["sha"], Value::from(head));
+    assert_eq!(branch["protected"], Value::Bool(false), "{branch}");
+    let (status, body) = get(&s, "/api/v3/repos/acme/docs/branches/main/protection").await?;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["message"], "Branch not protected", "{body}");
+    let rules = ok(&s, "/api/v3/repos/acme/docs/rules/branches/main").await?;
+    assert_eq!(rules, Value::Array(Vec::new()), "{rules}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn graphql_names_the_field_it_cannot_answer() -> TestResult {
     let s = server().await?;
