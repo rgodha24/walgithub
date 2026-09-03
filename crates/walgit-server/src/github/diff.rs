@@ -18,7 +18,7 @@
 
 use super::error::GhResult;
 use super::models::Urls;
-use super::reads;
+use super::repo;
 
 /// One entry of a compare's or a pull request's `files[]`.
 #[derive(Debug, Clone)]
@@ -50,8 +50,49 @@ fn status_of(code: &str) -> &'static str {
         Some('D') => "removed",
         Some('R') => "renamed",
         Some('C') => "copied",
+        Some('T') => "changed",
         _ => "modified",
     }
+}
+
+/// Totals for a pull request's `additions` / `deletions` / `changed_files`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Stats {
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+}
+
+/// Totals only — one `--numstat` pass, so a PR read does not pay for the
+/// patch bodies it never renders.
+pub async fn stats(local: &walgit_git::LocalRepo, base: &str, head: &str) -> GhResult<Stats> {
+    let out = repo::git(local, &numstat_args(base, head)).await?;
+    let records = parse_numstat(&String::from_utf8_lossy(&out));
+    let mut s = Stats {
+        changed_files: records.len() as u64,
+        ..Stats::default()
+    };
+    for r in &records {
+        s.additions = s.additions.saturating_add(r.additions);
+        s.deletions = s.deletions.saturating_add(r.deletions);
+    }
+    Ok(s)
+}
+
+fn numstat_args<'a>(base: &'a str, head: &'a str) -> [&'a str; 11] {
+    [
+        "-c",
+        "core.quotePath=false",
+        "diff-tree",
+        "-r",
+        "-M",
+        "-z",
+        "--numstat",
+        "--no-commit-id",
+        "--end-of-options",
+        base,
+        head,
+    ]
 }
 
 /// Every file that differs between two tree-ishes, with stats and patches.
@@ -60,9 +101,11 @@ pub async fn changed_files(
     base: &str,
     head: &str,
 ) -> GhResult<Vec<FileChange>> {
-    let raw = reads::git(
+    let raw = repo::git(
         local,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff-tree",
             "-r",
             "-M",
@@ -80,26 +123,14 @@ pub async fn changed_files(
         return Ok(files);
     }
 
-    let numstat = reads::git(
-        local,
-        &[
-            "diff-tree",
-            "-r",
-            "-M",
-            "-z",
-            "--numstat",
-            "--no-commit-id",
-            "--end-of-options",
-            base,
-            head,
-        ],
-    )
-    .await?;
+    let numstat = repo::git(local, &numstat_args(base, head)).await?;
     apply_numstat(&mut files, &String::from_utf8_lossy(&numstat));
 
-    let patch = reads::git(
+    let patch = repo::git(
         local,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff-tree",
             "-r",
             "-M",
@@ -153,11 +184,18 @@ fn parse_raw(out: &str) -> Vec<FileChange> {
     files
 }
 
+/// One `--numstat` record's counts.
+struct NumStat {
+    additions: u64,
+    deletions: u64,
+    binary: bool,
+}
+
 /// `<added>\t<deleted>\t<path>\0`, or `<added>\t<deleted>\t\0<old>\0<new>\0`
 /// for a rename. `-` in either count means the file is binary.
-fn apply_numstat(files: &mut [FileChange], out: &str) {
+fn parse_numstat(out: &str) -> Vec<NumStat> {
     let mut fields = out.split('\0').filter(|f| !f.is_empty());
-    let mut i = 0;
+    let mut rows = Vec::new();
     while let Some(record) = fields.next() {
         let mut cols = record.splitn(3, '\t');
         let (Some(add), Some(del), Some(rest)) = (cols.next(), cols.next(), cols.next()) else {
@@ -168,14 +206,30 @@ fn apply_numstat(files: &mut [FileChange], out: &str) {
             fields.next();
             fields.next();
         }
-        let Some(f) = files.get_mut(i) else { break };
-        i += 1;
-        if add == "-" || del == "-" {
-            f.binary = true;
-            continue;
-        }
-        f.additions = add.parse().unwrap_or(0);
-        f.deletions = del.parse().unwrap_or(0);
+        rows.push(if add == "-" || del == "-" {
+            NumStat {
+                additions: 0,
+                deletions: 0,
+                binary: true,
+            }
+        } else {
+            NumStat {
+                additions: add.parse().unwrap_or(0),
+                deletions: del.parse().unwrap_or(0),
+                binary: false,
+            }
+        });
+    }
+    rows
+}
+
+/// The counts land on the files `--raw` produced, in order: both passes apply
+/// the same rename detection to the same pair of trees.
+fn apply_numstat(files: &mut [FileChange], out: &str) {
+    for (f, n) in files.iter_mut().zip(parse_numstat(out)) {
+        f.binary = n.binary;
+        f.additions = n.additions;
+        f.deletions = n.deletions;
     }
 }
 

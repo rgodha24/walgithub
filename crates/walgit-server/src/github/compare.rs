@@ -19,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 
 use super::error::{GhError, GhResult};
 use super::models::{self, Urls};
-use super::reads;
 use super::repo::{self, View};
 use super::{diff, error};
 use crate::AppState;
@@ -100,12 +99,12 @@ pub async fn compare(
     let skip = page.saturating_sub(1);
 
     // Oldest first, which is the order `commits.at(-1)` is read as the head.
-    let log = reads::git(
+    let log = repo::git(
         &view.local,
         &[
             "log",
             "--reverse",
-            &format!("--format={}", reads::LOG_FORMAT),
+            &format!("--format={}", repo::LOG_FORMAT),
             "--no-color",
             &format!("--skip={}", skip.saturating_mul(commits_per)),
             &format!("-{commits_per}"),
@@ -115,7 +114,7 @@ pub async fn compare(
     )
     .await?;
     let urls = Urls::from_request(&st, &headers);
-    let commits: Vec<serde_json::Value> = reads::parse_commits(&log)
+    let commits: Vec<serde_json::Value> = repo::parse_commits(&log)
         .iter()
         .map(|c| models::commit(&urls, &view.full_name, c))
         .collect();
@@ -128,8 +127,8 @@ pub async fn compare(
         .map(|f| diff::file_json(&urls, &view.full_name, &head, f))
         .collect();
 
-    let base_commit = reads::commit_facts(&view.local, &base).await?;
-    let merge_base_commit = reads::commit_facts(&view.local, &merge_base).await?;
+    let base_commit = repo::commit_facts(&view.local, &base).await?;
+    let merge_base_commit = repo::commit_facts(&view.local, &merge_base).await?;
     let html = format!(
         "{}/{}/compare/{base}...{head}",
         urls.html, view.full_name
@@ -156,26 +155,16 @@ pub async fn compare(
 /// still answers a comparison there, and `merge_base_commit.sha` is read with
 /// no null guard.
 async fn merge_base(view: &View, base: &str, head: &str) -> GhResult<String> {
-    let out = reads::git(&view.local, &["merge-base", base, head]).await;
-    match out {
-        Ok(bytes) => {
-            let s = String::from_utf8_lossy(&bytes).trim().to_string();
-            Ok(if s.is_empty() { base.to_string() } else { s })
-        }
-        Err(_) => Ok(base.to_string()),
-    }
+    Ok(repo::merge_base(&view.local, base, head)
+        .await?
+        .unwrap_or_else(|| base.to_string()))
 }
 
 async fn count(view: &View, from: &str, to: &str) -> GhResult<u64> {
     if from == to {
         return Ok(0);
     }
-    let out = reads::git(
-        &view.local,
-        &["rev-list", "--count", "--end-of-options", &format!("{from}..{to}")],
-    )
-    .await?;
-    Ok(String::from_utf8_lossy(&out).trim().parse().unwrap_or(0))
+    repo::commit_count(&view.local, from, to).await
 }
 
 #[cfg(test)]

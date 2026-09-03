@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use walgit_store::Prefixed;
 
+use super::diff;
 use super::error::{FieldError, GhError, GhResult};
 use super::merge::{self, Method, Outcome};
 use super::models::{self, Urls};
@@ -463,7 +464,7 @@ async fn create_pull(
         .branch(&base_ref)
         .ok_or_else(|| validation("PullRequest", "base", format!("No commit found for the ref {base_ref}")))?
         .to_string();
-    if merge::commit_count(&ctx.view.local, &base_sha, &head_sha).await? == 0 {
+    if repo::commit_count(&ctx.view.local, &base_sha, &head_sha).await? == 0 {
         return Err(validation(
             "PullRequest",
             "head",
@@ -621,17 +622,17 @@ async fn detail_for(ctx: &Ctx, pr: &PullRequest, head_sha: &str) -> GhResult<Det
         .index
         .branch(&pr.base.ref_name)
         .map_or_else(|| pr.base.sha.clone(), ToString::to_string);
-    let merge_base = merge::merge_base(&ctx.view.local, &base_sha, head_sha)
+    let merge_base = repo::merge_base(&ctx.view.local, &base_sha, head_sha)
         .await?
         .unwrap_or_else(|| base_sha.clone());
-    let stats = merge::stats(&ctx.view.local, &merge_base, head_sha).await?;
-    let commits = merge::commit_count(&ctx.view.local, &merge_base, head_sha).await?;
+    let stats = diff::stats(&ctx.view.local, &merge_base, head_sha).await?;
+    let commits = repo::commit_count(&ctx.view.local, &merge_base, head_sha).await?;
     let (mergeable, state) = if pr.merged {
         (None, "merged")
     } else if !pr.is_open() {
         (None, "unknown")
     } else {
-        let scratch = merge::Scratch::new(ctx.view.local.path()).await?;
+        let scratch = super::write::Scratch::new(ctx.view.local.path()).await?;
         match scratch.merge_tree(&base_sha, head_sha, None).await? {
             Some(_) => (Some(true), "clean"),
             None => (Some(false), "dirty"),
@@ -755,33 +756,18 @@ async fn pull_files(
         .index
         .branch(&pr.base.ref_name)
         .map_or_else(|| pr.base.sha.clone(), ToString::to_string);
-    let merge_base = merge::merge_base(&ctx.view.local, &base_sha, &head_sha)
+    let merge_base = repo::merge_base(&ctx.view.local, &base_sha, &head_sha)
         .await?
         .unwrap_or(base_sha);
-    let files = merge::changed_files(&ctx.view.local, &merge_base, &head_sha).await?;
+    let files = diff::changed_files(&ctx.view.local, &merge_base, &head_sha).await?;
     let page = Page::new(q.page, q.per_page);
     let total = files.len();
     let full = &ctx.view.full_name;
-    let api = format!("{}/repos/{full}", ctx.urls.api);
     let out: Vec<Value> = files
         .iter()
         .skip(page.skip())
         .take(page.per_page)
-        .map(|f| {
-            json!({
-                "sha": f.sha,
-                "filename": f.filename,
-                "status": f.status,
-                "additions": f.additions,
-                "deletions": f.deletions,
-                "changes": f.additions.saturating_add(f.deletions),
-                "patch": f.patch,
-                "blob_url": format!("{}/{full}/blob/{head_sha}/{}", ctx.urls.html, f.filename),
-                "raw_url": format!("{}/{full}/raw/{head_sha}/{}", ctx.urls.html, f.filename),
-                "contents_url": format!("{api}/contents/{}?ref={head_sha}", f.filename),
-                "previous_filename": f.previous_filename,
-            })
-        })
+        .map(|f| diff::file_json(&ctx.urls, full, &head_sha, f))
         .collect();
     let more = page.skip() + out.len() < total;
     Ok(paginated(
@@ -808,15 +794,15 @@ async fn pull_commits(
         .index
         .branch(&pr.base.ref_name)
         .map_or_else(|| pr.base.sha.clone(), ToString::to_string);
-    let merge_base = merge::merge_base(&ctx.view.local, &base_sha, &head_sha)
+    let merge_base = repo::merge_base(&ctx.view.local, &base_sha, &head_sha)
         .await?
         .unwrap_or(base_sha);
-    let shas = merge::commits_between(&ctx.view.local, &merge_base, &head_sha).await?;
+    let shas = repo::commits_between(&ctx.view.local, &merge_base, &head_sha).await?;
     let page = Page::new(q.page, q.per_page);
     let total = shas.len();
     let mut out = Vec::new();
     for sha in shas.iter().skip(page.skip()).take(page.per_page) {
-        let facts = merge::commit_facts(&ctx.view.local, sha).await?;
+        let facts = repo::commit_facts(&ctx.view.local, sha).await?;
         out.push(models::commit(&ctx.urls, &ctx.view.full_name, &facts));
     }
     let more = page.skip() + out.len() < total;
@@ -1048,7 +1034,7 @@ async fn merge_branches(
             "Merge conflict",
         )),
         Outcome::Merged(sha) => {
-            let facts = merge::commit_facts(&ctx.view.local, &sha).await?;
+            let facts = repo::commit_facts(&ctx.view.local, &sha).await?;
             let commit = models::commit(&ctx.urls, &ctx.view.full_name, &facts);
             Ok((StatusCode::CREATED, Json(commit)).into_response())
         }

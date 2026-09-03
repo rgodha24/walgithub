@@ -88,7 +88,7 @@ pub async fn file_json(
     let (content, encoding) = if size > MAX_INLINE_BYTES {
         (String::new(), "none")
     } else {
-        let bytes = reads::git(&view.local, &["cat-file", "blob", &e.sha]).await?;
+        let bytes = repo::git(&view.local, &["cat-file", "blob", &e.sha]).await?;
         (reads::base64_github(&bytes), "base64")
     };
     if let Some(map) = body.as_object_mut() {
@@ -109,7 +109,7 @@ pub async fn file_response(
     e: &Entry,
 ) -> GhResult<Response> {
     if reads::wants_raw(headers) {
-        let bytes = reads::git(&view.local, &["cat-file", "blob", &e.sha]).await?;
+        let bytes = repo::git(&view.local, &["cat-file", "blob", &e.sha]).await?;
         return Ok(reads::raw_response(bytes));
     }
     Ok(axum::Json(file_json(view, urls, git_ref, e).await?).into_response())

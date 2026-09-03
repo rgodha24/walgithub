@@ -151,7 +151,9 @@ pub async fn commit_on_ref(
 
     let scratch = Scratch::new(local.path()).await?;
     let commit = scratch.build_commit(&req).await?;
-    let pack = scratch.pack(&commit, req.base.as_deref()).await?;
+    let pack = scratch
+        .pack(&commit, req.base.as_deref().as_slice())
+        .await?;
 
     let ingested = local
         .ingest_pack(
@@ -307,13 +309,13 @@ async fn publish(
 /// `GIT_WORK_TREE` points at an empty directory in the same tempdir: the
 /// serving copy is bare, and `read-tree`/`update-index` refuse to run without
 /// a work tree. Nothing is ever checked out into it.
-struct Scratch {
+pub(super) struct Scratch {
     dir: tempfile::TempDir,
     git_dir: PathBuf,
 }
 
 impl Scratch {
-    async fn new(git_dir: &Path) -> GhResult<Self> {
+    pub(super) async fn new(git_dir: &Path) -> GhResult<Self> {
         let git_dir = git_dir.to_path_buf();
         let dir = tokio::task::spawn_blocking(|| -> std::io::Result<tempfile::TempDir> {
             let dir = tempfile::Builder::new().prefix("walgit-gh-").tempdir()?;
@@ -327,7 +329,7 @@ impl Scratch {
         Ok(Self { dir, git_dir })
     }
 
-    fn command(&self) -> Command {
+    pub(super) fn command(&self) -> Command {
         let mut cmd = Command::new("git");
         cmd.current_dir(self.dir.path())
             .env("GIT_DIR", &self.git_dir)
@@ -344,7 +346,14 @@ impl Scratch {
         cmd
     }
 
-    async fn run(&self, mut cmd: Command, stdin: &[u8]) -> GhResult<Vec<u8>> {
+    /// Run one command to completion. The exit status is the caller's to
+    /// read: `merge-tree` answers a conflict with a non-zero status and a
+    /// tree on stdout.
+    pub(super) async fn run(
+        &self,
+        mut cmd: Command,
+        stdin: &[u8],
+    ) -> GhResult<std::process::Output> {
         use tokio::io::AsyncWriteExt;
         let mut child = cmd
             .spawn()
@@ -357,10 +366,16 @@ impl Scratch {
                 .await
                 .map_err(|e| GhError::Internal(format!("git stdin: {e}")))?;
         }
-        let out = child
+        child
             .wait_with_output()
             .await
-            .map_err(|e| GhError::Internal(format!("git: {e}")))?;
+            .map_err(|e| GhError::Internal(format!("git: {e}")))
+    }
+
+    /// [`Self::run`], with a non-zero exit turned into the error its stderr
+    /// names.
+    pub(super) async fn checked(&self, cmd: Command, stdin: &[u8]) -> GhResult<Vec<u8>> {
+        let out = self.run(cmd, stdin).await?;
         if out.status.success() {
             return Ok(out.stdout);
         }
@@ -369,8 +384,8 @@ impl Scratch {
         ))
     }
 
-    async fn text(&self, cmd: Command, stdin: &[u8]) -> GhResult<String> {
-        let out = self.run(cmd, stdin).await?;
+    pub(super) async fn text(&self, cmd: Command, stdin: &[u8]) -> GhResult<String> {
+        let out = self.checked(cmd, stdin).await?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
@@ -379,7 +394,7 @@ impl Scratch {
         if let Some(base) = &req.base {
             let mut c = self.command();
             c.args(["read-tree", &format!("{base}^{{tree}}")]);
-            self.run(c, &[]).await?;
+            self.checked(c, &[]).await?;
         }
         for change in &req.changes {
             match change {
@@ -398,12 +413,12 @@ impl Scratch {
                         "--cacheinfo",
                         &format!("{mode},{oid},{path}"),
                     ]);
-                    self.run(c, &[]).await?;
+                    self.checked(c, &[]).await?;
                 }
                 Change::Delete { path } => {
                     let mut c = self.command();
                     c.args(["update-index", "--force-remove", path]);
-                    self.run(c, &[]).await?;
+                    self.checked(c, &[]).await?;
                 }
             }
         }
@@ -430,12 +445,12 @@ impl Scratch {
         self.text(c, &[]).await
     }
 
-    /// A self-contained pack of everything `commit` adds over `base`.
-    async fn pack(&self, commit: &str, base: Option<&str>) -> GhResult<Vec<u8>> {
+    /// A self-contained pack of everything `commit` adds over `haves`.
+    pub(super) async fn pack(&self, commit: &str, haves: &[&str]) -> GhResult<Vec<u8>> {
         let mut revs = format!("{commit}\n");
-        if let Some(base) = base {
+        for have in haves {
             revs.push('^');
-            revs.push_str(base);
+            revs.push_str(have);
             revs.push('\n');
         }
         let mut c = self.command();
@@ -446,7 +461,7 @@ impl Scratch {
             "--delta-base-offset",
             "-q",
         ]);
-        self.run(c, revs.as_bytes()).await
+        self.checked(c, revs.as_bytes()).await
     }
 }
 

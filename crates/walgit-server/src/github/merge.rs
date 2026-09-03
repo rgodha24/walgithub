@@ -13,21 +13,20 @@
 //! → [`walgit_git::LocalRepo::ingest_pack`] → connectivity →
 //! [`walgit_wal::RepoHandle::publish_push_synced`].
 //!
-//! The diff helpers here (`changed_files`, `stats`, `commit_count`) are the
-//! minimum the PR endpoints need. They overlap with the compare/diff work in
-//! `github/diff.rs`; when the two land together, keep one.
+//! The diffs and the `rev-list` plumbing a PR needs are not here: `files[]`
+//! and its totals come from [`super::diff`] and the revision walks from
+//! [`super::repo`], both shared with the compare surface.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use tokio::process::Command;
 use walgit_git::{LocalRepo, RepoId};
 use walgit_proto::v1::{RefTransaction, RefUpdate};
 
 use super::error::{GhError, GhResult};
+use super::write::Scratch;
 use crate::AppState;
 
 /// GitHub answers an unmergeable PR with 405, not 409 — the Mintlify server
@@ -104,300 +103,6 @@ async fn git_text(local: &LocalRepo, args: &[&str]) -> GhResult<String> {
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// `git merge-base a b`. `None` when the histories are unrelated.
-pub async fn merge_base(local: &LocalRepo, a: &str, b: &str) -> GhResult<Option<String>> {
-    let out = git(local, &["merge-base", a, b]).await?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok((!sha.is_empty()).then_some(sha))
-}
-
-/// `git rev-list --count base..head` — GitHub's "commits between".
-pub async fn commit_count(local: &LocalRepo, base: &str, head: &str) -> GhResult<u64> {
-    let range = format!("{base}..{head}");
-    let out = git_text(local, &["rev-list", "--count", &range]).await?;
-    Ok(out.parse().unwrap_or(0))
-}
-
-/// The shas of `base..head`, oldest first.
-pub async fn commits_between(local: &LocalRepo, base: &str, head: &str) -> GhResult<Vec<String>> {
-    let range = format!("{base}..{head}");
-    let out = git_text(local, &["rev-list", "--reverse", &range]).await?;
-    Ok(out.lines().map(str::to_string).collect())
-}
-
-/// One entry of `GET /pulls/{n}/files`.
-#[derive(Debug, Clone)]
-pub struct FileChange {
-    pub sha: String,
-    pub filename: String,
-    pub status: &'static str,
-    pub additions: u64,
-    pub deletions: u64,
-    pub patch: Option<String>,
-    pub previous_filename: Option<String>,
-}
-
-/// Totals for a PR's `additions` / `deletions` / `changed_files`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Stats {
-    pub additions: u64,
-    pub deletions: u64,
-    pub changed_files: u64,
-}
-
-/// Every file that differs between two trees, with rename detection, counts
-/// and unified patches — GitHub's per-file shape minus the URLs, which the
-/// caller builds because only it knows the request's origin.
-pub async fn changed_files(local: &LocalRepo, base: &str, head: &str) -> GhResult<Vec<FileChange>> {
-    let raw = git(
-        local,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--raw",
-            "--no-abbrev",
-            "-z",
-            "-M",
-            "--no-color",
-            base,
-            head,
-        ],
-    )
-    .await?;
-    if !raw.status.success() {
-        return Err(GhError::not_found(format!("{base}...{head}")));
-    }
-    let counts = numstat(local, base, head).await?;
-    let patches = patches(local, base, head).await?;
-    let mut out = Vec::new();
-    for entry in parse_raw(&String::from_utf8_lossy(&raw.stdout)) {
-        let (additions, deletions) = counts.get(&entry.path).copied().unwrap_or((0, 0));
-        out.push(FileChange {
-            sha: entry.sha,
-            status: entry.status,
-            additions,
-            deletions,
-            patch: patches.get(&entry.path).cloned(),
-            previous_filename: entry.previous,
-            filename: entry.path,
-        });
-    }
-    Ok(out)
-}
-
-/// Totals only — no patches, so a PR read does not pay for a full diff body.
-pub async fn stats(local: &LocalRepo, base: &str, head: &str) -> GhResult<Stats> {
-    let counts = numstat(local, base, head).await?;
-    let mut s = Stats {
-        changed_files: counts.len() as u64,
-        ..Stats::default()
-    };
-    for (add, del) in counts.values() {
-        s.additions = s.additions.saturating_add(*add);
-        s.deletions = s.deletions.saturating_add(*del);
-    }
-    Ok(s)
-}
-
-struct RawEntry {
-    path: String,
-    previous: Option<String>,
-    sha: String,
-    status: &'static str,
-}
-
-/// `git diff --raw -z` records: `:<m> <m> <src> <dst> <status>\0<path>\0`,
-/// with a second path field for a rename or a copy.
-fn parse_raw(text: &str) -> Vec<RawEntry> {
-    let mut fields = text.split('\0').filter(|f| !f.is_empty());
-    let mut out = Vec::new();
-    while let Some(meta) = fields.next() {
-        let Some(meta) = meta.strip_prefix(':') else {
-            continue;
-        };
-        let cols: Vec<&str> = meta.split_whitespace().collect();
-        let (Some(dst), Some(code)) = (cols.get(3), cols.get(4)) else {
-            continue;
-        };
-        let letter = code.chars().next().unwrap_or('M');
-        let renamed = matches!(letter, 'R' | 'C');
-        let Some(first) = fields.next() else { break };
-        let (path, previous) = if renamed {
-            let Some(second) = fields.next() else { break };
-            (second.to_string(), Some(first.to_string()))
-        } else {
-            (first.to_string(), None)
-        };
-        out.push(RawEntry {
-            path,
-            previous,
-            sha: (*dst).to_string(),
-            status: status_word(letter),
-        });
-    }
-    out
-}
-
-fn status_word(letter: char) -> &'static str {
-    match letter {
-        'A' => "added",
-        'D' => "removed",
-        'R' => "renamed",
-        'C' => "copied",
-        'T' => "changed",
-        _ => "modified",
-    }
-}
-
-/// `git diff --numstat -z` keyed by the file's name after the change.
-async fn numstat(
-    local: &LocalRepo,
-    base: &str,
-    head: &str,
-) -> GhResult<HashMap<String, (u64, u64)>> {
-    let out = git(
-        local,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--numstat",
-            "-z",
-            "-M",
-            "--no-color",
-            base,
-            head,
-        ],
-    )
-    .await?;
-    if !out.status.success() {
-        return Err(GhError::not_found(format!("{base}...{head}")));
-    }
-    Ok(parse_numstat(&String::from_utf8_lossy(&out.stdout)))
-}
-
-/// A `-z` numstat record is `adds\tdels\t<path>\0`, and for a rename
-/// `adds\tdels\t\0<old>\0<new>\0` — the path moves out into its own fields.
-fn parse_numstat(text: &str) -> HashMap<String, (u64, u64)> {
-    let mut fields = text.split('\0').filter(|f| !f.is_empty()).peekable();
-    let mut out = HashMap::new();
-    while let Some(record) = fields.next() {
-        let mut cols = record.splitn(3, '\t');
-        let adds = cols.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        let dels = cols.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        let inline = cols.next().unwrap_or("");
-        let path = if inline.is_empty() {
-            let _old = fields.next();
-            match fields.next() {
-                Some(new) => new.to_string(),
-                None => break,
-            }
-        } else {
-            inline.to_string()
-        };
-        out.insert(path, (adds, dels));
-    }
-    out
-}
-
-/// One `git diff -p` pass, split into GitHub's per-file `patch` (the hunks,
-/// without the `diff --git` header). Binary files have none.
-async fn patches(local: &LocalRepo, base: &str, head: &str) -> GhResult<HashMap<String, String>> {
-    let out = git(
-        local,
-        &[
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "-p",
-            "-M",
-            "--no-color",
-            "--no-ext-diff",
-            base,
-            head,
-        ],
-    )
-    .await?;
-    if !out.status.success() {
-        return Ok(HashMap::new());
-    }
-    Ok(split_patches(&String::from_utf8_lossy(&out.stdout)))
-}
-
-fn split_patches(text: &str) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
-    let mut path: Option<String> = None;
-    let mut hunks: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        if line.starts_with("diff --git ") {
-            if let Some(p) = path.take()
-                && !hunks.is_empty()
-            {
-                out.insert(p, hunks.join("\n"));
-            }
-            hunks.clear();
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ b/") {
-            path = Some(rest.to_string());
-            continue;
-        }
-        if line.starts_with("+++ /dev/null") {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("--- a/") {
-            // Only a deletion leaves `+++ /dev/null`, and then the old path is
-            // the file's name; a later `+++ b/` overwrites this.
-            if path.is_none() {
-                path = Some(rest.to_string());
-            }
-            continue;
-        }
-        if line.starts_with("@@") || !hunks.is_empty() {
-            hunks.push(line);
-        }
-    }
-    if let Some(p) = path.take()
-        && !hunks.is_empty()
-    {
-        out.insert(p, hunks.join("\n"));
-    }
-    out
-}
-
-/// One commit's facts, straight out of the object database — enough to render
-/// GitHub's commit shape with [`super::models::commit`].
-pub async fn commit_facts(local: &LocalRepo, sha: &str) -> GhResult<super::models::CommitFacts> {
-    const FORMAT: &str = "--format=%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B";
-    let out = git(local, &["show", "-s", "--diff-merges=off", FORMAT, sha]).await?;
-    if !out.status.success() {
-        return Err(GhError::not_found(sha));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut f = text.split('\0');
-    let mut next = || f.next().unwrap_or("").to_string();
-    let facts = super::models::CommitFacts {
-        sha: next().trim().to_string(),
-        tree: next(),
-        parents: next().split_whitespace().map(str::to_string).collect(),
-        author_name: next(),
-        author_email: next(),
-        author_date: next(),
-        committer_name: next(),
-        committer_email: next(),
-        committer_date: next(),
-        message: next().trim_end_matches('\n').to_string(),
-    };
-    if facts.sha.is_empty() {
-        return Err(GhError::not_found(sha));
-    }
-    Ok(facts)
 }
 
 // ---- the merge itself --------------------------------------------------------
@@ -571,74 +276,9 @@ impl Author {
     }
 }
 
-/// A scratch object directory: writes land here, reads fall through to the
-/// serving copy's `objects/`. Mirrors `write.rs`'s `Scratch`.
-pub struct Scratch {
-    dir: tempfile::TempDir,
-    git_dir: PathBuf,
-}
-
+/// The merge-specific half of [`super::write::Scratch`]: the scratch object
+/// directory writes land in while the bare serving copy stays untouched.
 impl Scratch {
-    pub async fn new(git_dir: &Path) -> GhResult<Self> {
-        let git_dir = git_dir.to_path_buf();
-        let dir = tokio::task::spawn_blocking(|| -> std::io::Result<tempfile::TempDir> {
-            let dir = tempfile::Builder::new().prefix("walgit-gh-merge-").tempdir()?;
-            std::fs::create_dir_all(dir.path().join("objects"))?;
-            std::fs::create_dir_all(dir.path().join("worktree"))?;
-            Ok(dir)
-        })
-        .await
-        .map_err(|e| GhError::Internal(format!("scratch task: {e}")))?
-        .map_err(|e| GhError::Internal(format!("scratch dir: {e}")))?;
-        Ok(Self { dir, git_dir })
-    }
-
-    fn command(&self) -> Command {
-        let mut cmd = Command::new("git");
-        cmd.current_dir(self.dir.path())
-            .env("GIT_DIR", &self.git_dir)
-            .env("GIT_OBJECT_DIRECTORY", self.dir.path().join("objects"))
-            .env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                self.git_dir.join("objects"),
-            )
-            .env("GIT_INDEX_FILE", self.dir.path().join("index"))
-            .env("GIT_WORK_TREE", self.dir.path().join("worktree"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        cmd
-    }
-
-    async fn run(&self, mut cmd: Command, stdin: &[u8]) -> GhResult<std::process::Output> {
-        use tokio::io::AsyncWriteExt;
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GhError::Internal(format!("spawn git: {e}")))?;
-        if let Some(mut pipe) = child.stdin.take() {
-            pipe.write_all(stdin)
-                .await
-                .map_err(|e| GhError::Internal(format!("git stdin: {e}")))?;
-            pipe.shutdown()
-                .await
-                .map_err(|e| GhError::Internal(format!("git stdin: {e}")))?;
-        }
-        child
-            .wait_with_output()
-            .await
-            .map_err(|e| GhError::Internal(format!("git: {e}")))
-    }
-
-    async fn text(&self, cmd: Command, stdin: &[u8]) -> GhResult<String> {
-        let out = self.run(cmd, stdin).await?;
-        if !out.status.success() {
-            return Err(GhError::Internal(
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-
     /// `git merge-tree --write-tree`. `Ok(None)` is a conflict — the trees do
     /// not merge, which is GitHub's 405. `merge_base` overrides the common
     /// ancestor, which is how a rebase replays one commit at a time.
@@ -703,7 +343,7 @@ impl Scratch {
         base: &str,
         head: &str,
     ) -> GhResult<Option<String>> {
-        let commits = commits_between(local, base, head).await?;
+        let commits = super::repo::commits_between(local, base, head).await?;
         let mut onto = base.to_string();
         for sha in &commits {
             let parent = git_text(local, &["rev-parse", "--verify", &format!("{sha}^")])
@@ -721,32 +361,6 @@ impl Scratch {
             onto = self.commit_tree(&tree, &[&onto], &subject, &author).await?;
         }
         Ok(Some(onto))
-    }
-
-    /// A self-contained pack of everything `commit` adds over `haves`.
-    pub async fn pack(&self, commit: &str, haves: &[&str]) -> GhResult<Vec<u8>> {
-        let mut revs = format!("{commit}\n");
-        for have in haves {
-            revs.push('^');
-            revs.push_str(have);
-            revs.push('\n');
-        }
-        let mut c = self.command();
-        c.args([
-            "pack-objects",
-            "--revs",
-            "--stdout",
-            "--delta-base-offset",
-            "-q",
-        ]);
-        let out = self.run(c, revs.as_bytes()).await?;
-        if !out.status.success() {
-            return Err(GhError::Internal(format!(
-                "pack-objects: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        Ok(out.stdout)
     }
 
     /// Pack a whole history, for seeding a repository from a template.

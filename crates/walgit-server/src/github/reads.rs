@@ -8,10 +8,10 @@
 //! [`super::repo::objects_view`], which refuses with 503 when this instance
 //! serves the repository remotely.
 //!
-//! This module is also where the plumbing the other read modules share lives:
-//! [`git`], [`ls_tree`], [`commit_facts`] and [`base64_github`]. `repo.rs` has
-//! private copies of two of these; they are duplicated rather than made public
-//! there so this phase touches no existing file.
+//! The git plumbing every read module shares — `git`, `parse_commits`,
+//! `commit_facts`, `LOG_FORMAT` and the `rev-list` helpers — lives in
+//! [`super::repo`]; this module adds [`ls_tree`] and [`base64_github`] on top
+//! of it.
 
 #![allow(clippy::unused_async)]
 
@@ -25,78 +25,11 @@ use walgit_git::RepoId;
 use walgit_store::{ObjectStoreExt, PutMode};
 
 use super::error::{GhError, GhResult};
-use super::models::{self, CommitFacts, Urls};
+use super::models::{self, Urls};
 use super::repo::{self, View};
 use crate::AppState;
 
 // ---- shared plumbing ---------------------------------------------------------
-
-/// One record per commit, `\x1e`-separated, fields `\0`-separated. The message
-/// (`%B`) is last so it may contain anything but a NUL.
-pub const LOG_FORMAT: &str =
-    "%x1e%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B";
-
-/// Run `git` in the serving copy. A non-zero exit is a 404: every caller here
-/// is naming an object or a revision that the request supplied.
-pub async fn git(local: &walgit_git::LocalRepo, args: &[&str]) -> GhResult<Vec<u8>> {
-    let out = local
-        .git(args)
-        .await
-        .map_err(|e| GhError::Internal(format!("git: {e}")))?;
-    if out.status.success() {
-        return Ok(out.stdout);
-    }
-    Err(GhError::not_found(
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    ))
-}
-
-fn parse_commit(record: &str) -> Option<CommitFacts> {
-    let mut f = record.split('\0');
-    let sha = f.next()?.trim().to_string();
-    if sha.is_empty() {
-        return None;
-    }
-    Some(CommitFacts {
-        sha,
-        tree: f.next()?.to_string(),
-        parents: f.next()?.split_whitespace().map(str::to_string).collect(),
-        author_name: f.next()?.to_string(),
-        author_email: f.next()?.to_string(),
-        author_date: f.next()?.to_string(),
-        committer_name: f.next()?.to_string(),
-        committer_email: f.next()?.to_string(),
-        committer_date: f.next()?.to_string(),
-        message: f.next().unwrap_or("").trim_end_matches('\n').to_string(),
-    })
-}
-
-/// Parse the output of a `git log`/`git show` run with [`LOG_FORMAT`].
-pub fn parse_commits(bytes: &[u8]) -> Vec<CommitFacts> {
-    String::from_utf8_lossy(bytes)
-        .split('\x1e')
-        .filter_map(parse_commit)
-        .collect()
-}
-
-/// One commit object, parsed.
-pub async fn commit_facts(local: &walgit_git::LocalRepo, sha: &str) -> GhResult<CommitFacts> {
-    let out = git(
-        local,
-        &[
-            "show",
-            "-s",
-            "--diff-merges=off",
-            &format!("--format={LOG_FORMAT}"),
-            sha,
-        ],
-    )
-    .await?;
-    parse_commits(&out)
-        .into_iter()
-        .next()
-        .ok_or_else(|| GhError::not_found(sha))
-}
 
 /// One `ls-tree` row. `size` is `None` for anything that is not a blob.
 #[derive(Debug, Clone)]
@@ -129,7 +62,7 @@ pub async fn ls_tree(
         args.push("-t");
     }
     args.push(treeish);
-    let out = git(local, &args).await?;
+    let out = repo::git(local, &args).await?;
     Ok(String::from_utf8_lossy(&out)
         .split('\0')
         .filter_map(parse_ls_tree_row)
@@ -301,7 +234,7 @@ async fn resolve_tree(view: &View, what: &str) -> GhResult<String> {
     if start.is_empty() || start.starts_with('-') {
         return Err(GhError::not_found(what));
     }
-    let out = git(
+    let out = repo::git(
         &view.local,
         &[
             "rev-parse",
@@ -347,7 +280,7 @@ pub async fn read_blob(view: &View, what: &str) -> GhResult<(String, Vec<u8>)> {
     if what.is_empty() || what.starts_with('-') {
         return Err(GhError::not_found(what));
     }
-    let kind = git(
+    let kind = repo::git(
         &view.local,
         &["cat-file", "-t", "--end-of-options", what],
     )
@@ -356,14 +289,14 @@ pub async fn read_blob(view: &View, what: &str) -> GhResult<(String, Vec<u8>)> {
     if String::from_utf8_lossy(&kind).trim() != "blob" {
         return Err(GhError::not_found(what));
     }
-    let oid = git(
+    let oid = repo::git(
         &view.local,
         &["rev-parse", "--verify", "--quiet", "--end-of-options", what],
     )
     .await
     .map_err(|_| GhError::not_found(what))?;
     let oid = String::from_utf8_lossy(&oid).trim().to_string();
-    let bytes = git(&view.local, &["cat-file", "blob", &oid]).await?;
+    let bytes = repo::git(&view.local, &["cat-file", "blob", &oid]).await?;
     Ok((oid, bytes))
 }
 
@@ -723,7 +656,7 @@ pub async fn get_branch(
         .branch(&branch)
         .ok_or_else(|| GhError::not_found(&branch))?
         .to_string();
-    let facts = commit_facts(&view.local, &sha).await?;
+    let facts = repo::commit_facts(&view.local, &sha).await?;
     let urls = Urls::from_request(&st, &headers);
     let protected = load_protection(&st, &id).await?.covers(&branch);
     let mut body = models::branch(&urls, &view.full_name, &branch, &facts);

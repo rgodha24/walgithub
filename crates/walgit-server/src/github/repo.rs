@@ -124,10 +124,11 @@ fn pushed_at(handle: &RepoHandle) -> String {
 
 /// One record per commit, `\x1e`-separated, fields `\0`-separated. The message
 /// (`%B`) is last so it may contain anything but a NUL.
-const LOG_FORMAT: &str =
+pub(super) const LOG_FORMAT: &str =
     "%x1e%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B";
 
-fn parse_commits(bytes: &[u8]) -> Vec<CommitFacts> {
+/// Parse the output of a `git log`/`git show` run with [`LOG_FORMAT`].
+pub(super) fn parse_commits(bytes: &[u8]) -> Vec<CommitFacts> {
     String::from_utf8_lossy(bytes)
         .split('\x1e')
         .filter_map(parse_commit)
@@ -154,7 +155,9 @@ fn parse_commit(record: &str) -> Option<CommitFacts> {
     })
 }
 
-async fn git(local: &walgit_git::LocalRepo, args: &[&str]) -> GhResult<Vec<u8>> {
+/// Run `git` in the serving copy. A non-zero exit is a 404: every caller is
+/// naming an object or a revision the request supplied.
+pub(super) async fn git(local: &walgit_git::LocalRepo, args: &[&str]) -> GhResult<Vec<u8>> {
     let out = local
         .git(args)
         .await
@@ -204,14 +207,19 @@ pub async fn resolve_commitish(view: &View, r: &str) -> GhResult<String> {
     Ok(sha)
 }
 
-async fn commit_facts(view: &View, sha: &str) -> GhResult<CommitFacts> {
+/// One commit object, parsed.
+pub(super) async fn commit_facts(
+    local: &walgit_git::LocalRepo,
+    sha: &str,
+) -> GhResult<CommitFacts> {
     let out = git(
-        &view.local,
+        local,
         &[
             "show",
             "-s",
             "--diff-merges=off",
             &format!("--format={LOG_FORMAT}"),
+            "--end-of-options",
             sha,
         ],
     )
@@ -220,6 +228,50 @@ async fn commit_facts(view: &View, sha: &str) -> GhResult<CommitFacts> {
         .into_iter()
         .next()
         .ok_or_else(|| GhError::not_found(sha))
+}
+
+/// `git merge-base a b`. `None` when the histories are unrelated.
+pub(super) async fn merge_base(
+    local: &walgit_git::LocalRepo,
+    a: &str,
+    b: &str,
+) -> GhResult<Option<String>> {
+    let Ok(out) = git(local, &["merge-base", a, b]).await else {
+        return Ok(None);
+    };
+    let sha = String::from_utf8_lossy(&out).trim().to_string();
+    Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// `git rev-list --count base..head` — GitHub's "commits between".
+pub(super) async fn commit_count(
+    local: &walgit_git::LocalRepo,
+    base: &str,
+    head: &str,
+) -> GhResult<u64> {
+    let range = format!("{base}..{head}");
+    let out = git(local, &["rev-list", "--count", "--end-of-options", &range]).await?;
+    Ok(String::from_utf8_lossy(&out).trim().parse().unwrap_or(0))
+}
+
+/// The shas of `base..head`, oldest first.
+pub(super) async fn commits_between(
+    local: &walgit_git::LocalRepo,
+    base: &str,
+    head: &str,
+) -> GhResult<Vec<String>> {
+    let range = format!("{base}..{head}");
+    let out = git(
+        local,
+        &["rev-list", "--reverse", "--end-of-options", &range],
+    )
+    .await?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 // ---- pagination --------------------------------------------------------------
@@ -358,7 +410,7 @@ pub async fn get_commit(
     let id = repo_id(&owner, &name)?;
     let view = objects_view(&st, &id).await?;
     let sha = resolve_commitish(&view, &r).await?;
-    let facts = commit_facts(&view, &sha).await?;
+    let facts = commit_facts(&view.local, &sha).await?;
     let urls = Urls::from_request(&st, &headers);
     Ok(axum::Json(models::commit(&urls, &view.full_name, &facts)).into_response())
 }
@@ -372,7 +424,7 @@ pub async fn get_git_commit(
     let id = repo_id(&owner, &name)?;
     let view = objects_view(&st, &id).await?;
     let sha = resolve_commitish(&view, &sha).await?;
-    let facts = commit_facts(&view, &sha).await?;
+    let facts = commit_facts(&view.local, &sha).await?;
     let urls = Urls::from_request(&st, &headers);
     Ok(axum::Json(models::git_commit(&urls, &view.full_name, &facts)).into_response())
 }
@@ -441,7 +493,7 @@ pub async fn get_branch(
         .branch(&branch)
         .ok_or_else(|| GhError::not_found(&branch))?
         .to_string();
-    let facts = commit_facts(&view, &sha).await?;
+    let facts = commit_facts(&view.local, &sha).await?;
     let urls = Urls::from_request(&st, &headers);
     Ok(axum::Json(models::branch(&urls, &view.full_name, &branch, &facts)).into_response())
 }

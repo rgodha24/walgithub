@@ -102,10 +102,6 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/api/v3/repos/{owner}/{repo}/deployments/{deployment_id}/statuses",
             get(list_deployment_statuses).post(create_deployment_status),
         )
-        .route(
-            "/api/v3/repos/{owner}/{repo}/rules/branches/{branch}",
-            get(branch_rules),
-        )
 }
 
 fn now() -> String {
@@ -392,15 +388,6 @@ pub fn combined_status(urls: &Urls, full_name: &str, sha: &str) -> Response {
 /// `GET /repos/{o}/{r}/commits/{ref}/statuses` — the facade runs no checks.
 pub fn commit_statuses() -> Response {
     Json(Value::Array(Vec::new())).into_response()
-}
-
-/// `GET /repos/{o}/{r}/rules/branches/{branch}` — no rulesets exist, and an
-/// empty array is only read as "legacy protection" when the branch also
-/// reports `protected: true`, which the facade never does.
-async fn branch_rules(
-    Path((_owner, _name, _branch)): Path<(String, String, String)>,
-) -> GhResult<Response> {
-    Ok(Json(Value::Array(Vec::new())).into_response())
 }
 
 #[cfg(test)]

@@ -65,69 +65,23 @@ fn not_found_as_repository(e: crate::github::error::GhError, id: &RepoId) -> Gql
 }
 
 // ---- git ---------------------------------------------------------------------
-
-/// `\x1e`-separated records, `\0`-separated fields, message last.
-const LOG_FORMAT: &str =
-    "%x1e%H%x00%T%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B";
+//
+// The plumbing itself is [`crate::github::repo`]'s; only the error wording is
+// GraphQL's.
 
 pub async fn git(view: &View, args: &[&str]) -> Result<Vec<u8>, GqlError> {
-    let out = view
-        .local
-        .git(args)
-        .await
-        .map_err(|e| GqlError::internal(format!("git: {e}")))?;
-    if out.status.success() {
-        return Ok(out.stdout);
-    }
-    Err(GqlError::not_found(
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    ))
-}
-
-fn parse_commits(bytes: &[u8]) -> Vec<CommitFacts> {
-    String::from_utf8_lossy(bytes)
-        .split('\x1e')
-        .filter_map(parse_commit)
-        .collect()
-}
-
-fn parse_commit(record: &str) -> Option<CommitFacts> {
-    let mut f = record.split('\0');
-    let sha = f.next()?.trim().to_string();
-    if sha.is_empty() {
-        return None;
-    }
-    Some(CommitFacts {
-        sha,
-        tree: f.next()?.to_string(),
-        parents: f.next()?.split_whitespace().map(str::to_string).collect(),
-        author_name: f.next()?.to_string(),
-        author_email: f.next()?.to_string(),
-        author_date: f.next()?.to_string(),
-        committer_name: f.next()?.to_string(),
-        committer_email: f.next()?.to_string(),
-        committer_date: f.next()?.to_string(),
-        message: f.next().unwrap_or("").trim_end_matches('\n').to_string(),
-    })
+    repo::git(&view.local, args).await.map_err(GqlError::from)
 }
 
 pub async fn commit_facts(view: &View, sha: &str) -> Result<CommitFacts, GqlError> {
-    let out = git(
-        view,
-        &[
-            "show",
-            "-s",
-            "--diff-merges=off",
-            &format!("--format={LOG_FORMAT}"),
-            "--end-of-options",
-            sha,
-        ],
-    )
-    .await?;
-    parse_commits(&out)
-        .into_iter()
-        .next()
-        .ok_or_else(|| GqlError::not_found(format!("Could not resolve to a Commit with {sha}.")))
+    repo::commit_facts(&view.local, sha)
+        .await
+        .map_err(|e| match e {
+            crate::github::error::GhError::NotFound(_) => {
+                GqlError::not_found(format!("Could not resolve to a Commit with {sha}."))
+            }
+            other => GqlError::from(other),
+        })
 }
 
 // ---- nodes -------------------------------------------------------------------
@@ -400,7 +354,7 @@ async fn history(ctx: &Ctx, view: &View, f: &Field, tip: &str) -> Result<Value, 
     let skip = decode_cursor(f.str_arg("after"));
     let mut args = vec![
         "log".to_string(),
-        format!("--format={LOG_FORMAT}"),
+        format!("--format={}", repo::LOG_FORMAT),
         "--no-color".to_string(),
         format!("--skip={skip}"),
         format!("-{}", first.saturating_add(1)),
@@ -412,7 +366,7 @@ async fn history(ctx: &Ctx, view: &View, f: &Field, tip: &str) -> Result<Value, 
         args.push(path.to_string());
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut facts = parse_commits(&git(view, &argv).await?);
+    let mut facts = repo::parse_commits(&git(view, &argv).await?);
     let more = facts.len() > first;
     facts.truncate(first);
     let next = skip + facts.len();
