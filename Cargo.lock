@@ -6025,6 +6025,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls 0.23.43",
  "serde",
+ "serde_json",
  "sha1 0.10.7",
  "tempfile",
  "thiserror 2.0.20",

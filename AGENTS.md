@@ -444,6 +444,10 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---
 
+**D43 — AWS runtime credentials (2026-09-08).** The S3 backend uses the AWS SDK credential chain when
+neither configured static-key variable is set. This supports refreshing ECS task roles without storing
+long-lived access keys. Explicit pairs still support local object stores; partial pairs fail closed.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

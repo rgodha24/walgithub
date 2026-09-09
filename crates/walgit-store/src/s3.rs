@@ -69,30 +69,22 @@ pub struct S3Store {
 impl S3Store {
     /// Build a store from `walgit-config::StoreConfig`.
     ///
-    /// Credentials are read from the env vars named in
-    /// `cfg.s3.access_key_env` / `cfg.s3.secret_key_env`
-    /// (defaults `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`), plus
-    /// `AWS_SESSION_TOKEN` when present.
+    /// Explicit credentials come from the configured environment variables.
+    /// When neither is set, use the AWS SDK chain (including refreshing ECS
+    /// task-role credentials). A partially configured pair is an error.
     pub async fn new(cfg: &walgit_config::StoreConfig) -> anyhow::Result<Self> {
-        let access_key = std::env::var(&cfg.s3.access_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (access key)", cfg.s3.access_key_env)
-        })?;
-        let secret_key = std::env::var(&cfg.s3.secret_key_env).map_err(|_| {
-            anyhow::anyhow!("s3: env var {} not set (secret key)", cfg.s3.secret_key_env)
-        })?;
-
-        let creds = static_credentials(
-            &access_key,
-            &secret_key,
-            std::env::var("AWS_SESSION_TOKEN").ok(),
-        );
         let region = aws_sdk_s3::config::Region::new(cfg.s3.region.clone());
-
-        let mut s3_config = aws_sdk_s3::Config::builder()
-            .region(region)
-            .credentials_provider(creds)
-            .force_path_style(cfg.s3.force_path_style)
-            .behavior_version_latest();
+        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region);
+        if let Some(creds) = explicit_credentials(
+            std::env::var(&cfg.s3.access_key_env).ok(),
+            std::env::var(&cfg.s3.secret_key_env).ok(),
+            std::env::var("AWS_SESSION_TOKEN").ok(),
+        )? {
+            loader = loader.credentials_provider(creds);
+        }
+        let sdk_config = loader.load().await;
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .force_path_style(cfg.s3.force_path_style);
 
         if !cfg.s3.endpoint.is_empty() {
             s3_config = s3_config.endpoint_url(&cfg.s3.endpoint);
@@ -895,12 +887,20 @@ impl S3Store {
     }
 }
 
-fn static_credentials(
-    access_key: &str,
-    secret_key: &str,
+fn explicit_credentials(
+    access_key: Option<String>,
+    secret_key: Option<String>,
     session_token: Option<String>,
-) -> Credentials {
-    Credentials::new(access_key, secret_key, session_token, None, "walgit-static")
+) -> anyhow::Result<Option<Credentials>> {
+    match (access_key, secret_key) {
+        (None, None) => Ok(None),
+        (Some(access), Some(secret)) if !access.is_empty() && !secret.is_empty() => Ok(Some(
+            Credentials::new(access, secret, session_token, None, "walgit-static"),
+        )),
+        _ => anyhow::bail!(
+            "s3: set both configured access-key and secret-key environment variables, or neither to use the AWS credential chain"
+        ),
+    }
 }
 
 // ---- rustfs compatibility notes (integration testing) -------------------
@@ -923,20 +923,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn static_credentials_include_session_token_when_present() {
-        let creds = static_credentials("access", "secret", Some("session".into()));
-
+    fn explicit_keys_preserve_session_token() {
+        let creds = explicit_credentials(
+            Some("access".into()),
+            Some("secret".into()),
+            Some("session".into()),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(creds.access_key_id(), "access");
         assert_eq!(creds.secret_access_key(), "secret");
         assert_eq!(creds.session_token(), Some("session"));
     }
 
     #[test]
-    fn static_credentials_work_without_session_token() {
-        let creds = static_credentials("access", "secret", None);
+    fn missing_keys_select_the_sdk_chain_but_partial_keys_fail() {
+        assert!(explicit_credentials(None, None, None).unwrap().is_none());
+        assert!(explicit_credentials(Some("access".into()), None, None).is_err());
+        assert!(explicit_credentials(None, Some("secret".into()), None).is_err());
+        assert!(explicit_credentials(Some(String::new()), Some("secret".into()), None).is_err());
+    }
 
-        assert_eq!(creds.access_key_id(), "access");
-        assert_eq!(creds.secret_access_key(), "secret");
-        assert_eq!(creds.session_token(), None);
+    // Run credential-chain discovery in a child process so tests never mutate
+    // process-global AWS environment variables or use the developer's profile.
+    #[tokio::test]
+    async fn ecs_credentials_child() {
+        if std::env::var("WALGIT_TEST_ECS_CREDENTIALS").is_err() {
+            return;
+        }
+        let mut cfg = walgit_config::StoreConfig::default();
+        cfg.s3.endpoint = std::env::var("WALGIT_TEST_S3_ENDPOINT").unwrap();
+        cfg.s3.force_path_style = true;
+        let store = S3Store::new(&cfg).await.unwrap();
+        store
+            .client
+            .head_bucket()
+            .bucket("ecs-test")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdk_chain_loads_ecs_task_credentials_without_static_keys() {
+        let app = axum::Router::new().route(
+            "/credentials",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "AccessKeyId": "ecs-access",
+                    "SecretAccessKey": "ecs-secret",
+                    "Token": "ecs-session",
+                    "Expiration": "2099-01-01T00:00:00Z"
+                }))
+            }),
+        );
+        let app = app.route(
+            "/ecs-test/",
+            axum::routing::head(|headers: axum::http::HeaderMap| async move {
+                assert!(
+                    headers["authorization"]
+                        .to_str()
+                        .unwrap()
+                        .contains("Credential=ecs-access/")
+                );
+                assert_eq!(headers["x-amz-security-token"], "ecs-session");
+                axum::http::StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "s3::tests::ecs_credentials_child", "--nocapture"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("AWS_") {
+                child.env_remove(key);
+            }
+        }
+        let result = child
+            .env("WALGIT_TEST_ECS_CREDENTIALS", "1")
+            .env("WALGIT_TEST_S3_ENDPOINT", format!("http://{address}"))
+            .env(
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+                format!("http://{address}/credentials"),
+            )
+            .env("AWS_EC2_METADATA_DISABLED", "true")
+            .env("AWS_CONFIG_FILE", dir.path().join("config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                dir.path().join("credentials"),
+            )
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(std::time::Duration::from_secs(20), result)
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
