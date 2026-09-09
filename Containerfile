@@ -1,8 +1,9 @@
-# walgit container image — one binary in front of an object store.
+# walgithub image — private GitHub facade for editor E2Es.
 #
 #   podman build -t walgit -f Containerfile .
-#   podman run --rm -p 8080:8080 \
+#   podman run --rm -p 127.0.0.1:8097:8097 \
 #       -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+#       -e WALGIT__STORE__BUCKET=your-bucket \
 #       -v ./walgit.toml:/etc/walgit/walgit.toml:ro \
 #       -v walgit-cache:/var/lib/walgit \
 #       walgit
@@ -11,7 +12,7 @@
 # git-lfs, CA certificates and tini. Config comes from /etc/walgit/walgit.toml or
 # WALGIT__SECTION__KEY environment overrides; the local cache (materialized repositories,
 # a self-signed TLS cert) lives under /var/lib/walgit and can be wiped at any time — the
-# bucket is the only durable state. `nix build .#image` produces the same thing from flake.nix.
+# bucket is the only durable state. flake.nix provides separate standalone walgit packaging.
 
 # ---- 1. web UI (embedded into the binary at compile time) ---------------------------
 FROM docker.io/library/node:24-bookworm-slim AS web
@@ -48,15 +49,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git git-lfs ca-
 RUN useradd --uid 1000 --create-home --shell /bin/sh walgit \
     && mkdir -p /etc/walgit /var/lib/walgit && chown walgit:walgit /var/lib/walgit
 COPY --from=build /out/bin/walgit /out/bin/walgit-server /usr/local/bin/
-COPY walgit.example.toml /etc/walgit/walgit.toml
-ENV RUST_LOG=info,walgit=debug \
-    WALGIT_CONFIG=/etc/walgit/walgit.toml \
-    WALGIT__CACHE__DIR=/var/lib/walgit \
-    WALGIT__SERVER__LISTEN=0.0.0.0:8080
+COPY deploy/walgithub.toml /etc/walgit/walgit.toml
+ENV WALGIT_CONFIG=/etc/walgit/walgit.toml
 USER walgit
 WORKDIR /home/walgit
-EXPOSE 8080
+EXPOSE 8097
 VOLUME ["/var/lib/walgit"]
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8080/readyz || exit 1
-ENTRYPOINT ["tini", "--", "walgit"]
-CMD ["serve"]
+HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8097/readyz || exit 1
+ENTRYPOINT ["tini", "--", "walgit-server"]

@@ -453,6 +453,10 @@ long-lived access keys. Explicit pairs still support local object stores; partia
 GitHub releases. Release tags select commits already on main; AWS OIDC grants access only to the dev ECR
 repository. Infrastructure selects the resulting digest separately. See `docs/RELEASING.md`.
 
+**D45 — Facade runtime configuration (2026-09-09).** The walgithub image packages
+`deploy/walgithub.toml`; facade behavior changes ship with its release. Pulumi supplies only
+AWS resource bindings (bucket, region, private origin, and injected webhook secret).
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

@@ -1,0 +1,34 @@
+# Runtime defaults for the private editor E2E facade image.
+# ECS supplies the bucket, region, private origin, and webhook secret.
+[server]
+listen = "0.0.0.0:8097"
+auto_create_on_push = true
+
+[server.auth]
+mode = "none"
+
+[server.tls]
+mode = "off"
+
+[github]
+enabled = true
+webhook_url = "https://example.com/github-enterprise/e2etest"
+webhook_poll_interval = "1s"
+installation_id = 1
+
+[store]
+backend = "s3"
+prefix = ""
+
+[store.s3]
+# Let the AWS SDK choose its endpoint from the injected region.
+endpoint = ""
+force_path_style = false
+
+[cache]
+dir = "/var/lib/walgit"
+max_bytes = "5GiB"
+
+[telemetry]
+log_format = "json"
+log_filter = "info"
