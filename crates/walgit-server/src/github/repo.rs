@@ -298,7 +298,10 @@ impl Page {
     fn from(q: &PageQuery) -> Self {
         Self {
             page: q.page.unwrap_or(1).max(1),
-            per_page: q.per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE),
+            per_page: q
+                .per_page
+                .unwrap_or(DEFAULT_PER_PAGE)
+                .clamp(1, MAX_PER_PAGE),
         }
     }
     fn skip(&self) -> usize {
@@ -364,7 +367,7 @@ pub async fn get_repo(
     .into_response())
 }
 
-/// `GET /api/v3/installation/repositories` — every repository in the bucket.
+/// `GET /api/v3/installation/repositories` — only repositories selected for this installation.
 pub async fn installation_repositories(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -377,6 +380,10 @@ pub async fn installation_repositories(
         .list()
         .await
         .map_err(|e| GhError::Internal(e.to_string()))?;
+    let integrations = super::integrations::read(st.registry.store()).await?;
+    let (_, install) =
+        integrations.installation(super::integrations::token_installation(&headers)?)?;
+    ids.retain(|id| install.matches(id));
     ids.sort_by_key(ToString::to_string);
     let total = ids.len();
     let mut repos = Vec::new();
@@ -396,7 +403,7 @@ pub async fn installation_repositories(
     let more = page.skip() + repos.len() < total;
     let body = axum::Json(serde_json::json!({
         "total_count": total,
-        "repository_selection": "all",
+        "repository_selection": install.repository_selection,
         "repositories": repos,
     }))
     .into_response();
@@ -474,7 +481,10 @@ pub async fn list_commits(
         .iter()
         .map(|c| models::commit(&urls, &view.full_name, c))
         .collect();
-    let query = q.sha.as_deref().map_or_else(String::new, |s| format!("sha={s}"));
+    let query = q
+        .sha
+        .as_deref()
+        .map_or_else(String::new, |s| format!("sha={s}"));
     let link = link_header(
         &urls,
         &format!("/repos/{}/commits", view.full_name),

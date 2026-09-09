@@ -783,17 +783,6 @@ impl Default for EventsConfig {
 pub struct GithubConfig {
     /// Mount the facade. Off everywhere but a developer's machine.
     pub enabled: bool,
-    /// Where GitHub-shaped webhooks go (`docs/GITHUB.md` §Webhooks). Set it and
-    /// the events bridge renders every WAL ref event as a `push` / `create` /
-    /// `delete` delivery besides the walgit-native `events.webhook_url` batch,
-    /// and the PR handlers send `pull_request` deliveries. Unset = no webhooks.
-    pub webhook_url: Option<String>,
-    /// Shared secret for `x-hub-signature-256: sha256=<HMAC-SHA256 of the raw
-    /// body>`. Unset = unsigned, which every GitHub client rejects.
-    pub webhook_secret: Option<String>,
-    /// `installation.id` in every payload. A GitHub App consumer keys its
-    /// install on this.
-    pub installation_id: u64,
     /// How often the bridge polls for ref changes while the github sink is on.
     /// A push on this instance wakes the bridge directly, so this only covers
     /// writes by another process (and stores with no notifications, which is
@@ -806,9 +795,6 @@ impl Default for GithubConfig {
     fn default() -> Self {
         GithubConfig {
             enabled: false,
-            webhook_url: None,
-            webhook_secret: None,
-            installation_id: 1,
             webhook_poll_interval: Duration::from_secs(1),
         }
     }
@@ -1637,12 +1623,6 @@ impl Config {
                 "events.webhook_url must be an http(s) URL"
             );
         }
-        if let Some(u) = &self.github.webhook_url {
-            anyhow::ensure!(
-                u.starts_with("http://") || u.starts_with("https://"),
-                "github.webhook_url must be an http(s) URL"
-            );
-        }
         Ok(())
     }
 
@@ -2043,26 +2023,20 @@ webhook_secret = "s"
     #[test]
     fn github_webhook_section_parses_and_validates() {
         let d = GithubConfig::default();
-        assert_eq!(d.installation_id, 1);
         assert_eq!(d.webhook_poll_interval, Duration::from_secs(1));
-        assert!(d.webhook_url.is_none() && d.webhook_secret.is_none());
         let c = Config::parse(
             r#"
 [server.auth]
 mode = "none"
 [github]
 enabled = true
-webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"
-webhook_secret = "s"
-installation_id = 55555555
 webhook_poll_interval = "250ms"
 "#,
         )
         .unwrap();
-        assert_eq!(c.github.installation_id, 55_555_555);
         assert_eq!(c.github.webhook_poll_interval, Duration::from_millis(250));
         let err = Config::parse("[github]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
-        assert!(err.to_string().contains("github.webhook_url"), "{err}");
+        assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
     }
 
     #[test]

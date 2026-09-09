@@ -7,7 +7,7 @@
 
 use serde::Serialize;
 
-use super::auth::{INSTALLATION_ID, INSTALLATION_TOKEN, USER_ID, USER_LOGIN};
+use super::auth::{USER_ID, USER_LOGIN};
 
 /// The origins a response's URLs are built from: `api` is what octokit's
 /// `baseUrl` points at (`…/api/v3`), `html` is the browser origin.
@@ -107,16 +107,21 @@ pub fn app(urls: &Urls) -> serde_json::Value {
     })
 }
 
-pub fn installation(urls: &Urls, id: u64) -> serde_json::Value {
+pub fn installation(
+    urls: &Urls,
+    app_id: u64,
+    install: &super::integrations::Installation,
+) -> serde_json::Value {
+    let id = install.id;
     serde_json::json!({
         "id": id,
         "node_id": node_id("Installation", &id.to_string()),
-        "account": user(urls),
-        "repository_selection": "all",
+        "account": named_user(urls, &install.owner),
+        "repository_selection": install.repository_selection,
         "access_tokens_url": format!("{}/app/installations/{id}/access_tokens", urls.api),
         "repositories_url": format!("{}/installation/repositories", urls.api),
         "html_url": format!("{}/settings/installations/{id}", urls.html),
-        "app_id": 1,
+        "app_id": app_id,
         "app_slug": "walgit-github-facade",
         "target_id": USER_ID,
         "target_type": "User",
@@ -129,15 +134,15 @@ pub fn installation(urls: &Urls, id: u64) -> serde_json::Value {
     })
 }
 
-pub fn access_token(urls: &Urls) -> serde_json::Value {
+pub fn access_token(urls: &Urls, install: &super::integrations::Installation) -> serde_json::Value {
     let expires = chrono::Utc::now() + chrono::Duration::hours(1);
     serde_json::json!({
-        "token": INSTALLATION_TOKEN,
+        "token": format!("ghs_walgit_{}", install.id),
         "expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "permissions": permissions(),
-        "repository_selection": "all",
+        "repository_selection": install.repository_selection,
         "installation": {
-            "id": INSTALLATION_ID,
+            "id": install.id,
             "repositories_url": format!("{}/installation/repositories", urls.api),
         },
     })

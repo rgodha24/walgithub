@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, OnceLock, Weak};
 
+use futures::StreamExt;
 use serde_json::{Value, json};
 use walgit_git::RepoId;
 
@@ -36,30 +37,30 @@ const PR_ATTEMPTS: u32 = 3;
 
 // ---- the sender --------------------------------------------------------------
 
-/// One signed POST to `github.webhook_url`.
+/// One signed POST to an integration callback.
 pub struct Sender {
     url: String,
-    secret: Option<Vec<u8>>,
+    secret: Vec<u8>,
     client: reqwest::Client,
 }
 
 impl Sender {
-    /// `None` unless `github.webhook_url` is set.
-    pub fn from_cfg(cfg: &walgit_config::Config) -> Option<Sender> {
-        let url = cfg.github.webhook_url.clone()?;
-        Some(Sender {
-            url,
-            secret: cfg
-                .github
-                .webhook_secret
-                .clone()
-                .filter(|s| !s.is_empty())
-                .map(String::into_bytes),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
-        })
+    pub fn new(integration: &super::integrations::Integration) -> Sender {
+        Sender {
+            url: integration.webhook_url.clone(),
+            secret: integration.webhook_secret.as_bytes().to_vec(),
+            client: {
+                static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+                CLIENT
+                    .get_or_init(|| {
+                        reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(10))
+                            .build()
+                            .unwrap_or_default()
+                    })
+                    .clone()
+            },
+        }
     }
 
     /// POST one event. Non-2xx and timeouts are errors; the caller decides
@@ -74,13 +75,15 @@ impl Sender {
             .header(reqwest::header::USER_AGENT, "GitHub-Hookshot/walgit")
             .header("x-github-event", event)
             .header("x-github-delivery", &delivery);
-        if let Some(secret) = &self.secret {
-            req = req.header(
-                "x-hub-signature-256",
-                crate::events::WebhookSink::signature(secret, &body),
-            );
-        }
-        let resp = req.body(body).send().await?;
+        req = req.header(
+            "x-hub-signature-256",
+            crate::events::WebhookSink::signature(&self.secret, &body),
+        );
+        let resp = req
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("GitHub webhook request failed"))?;
         let status = resp.status();
         anyhow::ensure!(
             status.is_success(),
@@ -94,24 +97,51 @@ impl Sender {
 /// Fire one `pull_request` (or any handler-side) delivery in the background.
 /// Never awaited by a request handler: a slow consumer must not slow a write.
 pub fn spawn(st: &Arc<AppState>, event: &'static str, payload: Value) {
-    let Some(sender) = Sender::from_cfg(&st.cfg) else {
-        return;
-    };
+    let st = st.clone();
     tokio::spawn(async move {
-        for attempt in 1..=PR_ATTEMPTS {
-            match sender.deliver(event, &payload).await {
-                Ok(()) => return,
-                Err(e) if attempt == PR_ATTEMPTS => {
-                    tracing::warn!(event, error = %e, attempts = attempt,
-                        "github webhook delivery failed");
-                }
-                Err(e) => {
-                    tracing::warn!(event, error = %e, attempt, "github webhook delivery failed; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt)))
-                        .await;
+        let Some(full_name) = payload["repository"]["full_name"].as_str() else {
+            return;
+        };
+        let Ok(id) = full_name.parse::<RepoId>() else {
+            return;
+        };
+        let registry = match super::integrations::read(st.registry.store()).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(event, "could not load GitHub webhook integrations");
+                return;
+            }
+        };
+        let subscriptions = match registry.subscriptions(&id) {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(event, "invalid GitHub webhook subscriptions");
+                return;
+            }
+        };
+        let deliveries: Vec<_> = subscriptions.into_iter().map(|subscription| {
+            let sender = Sender::new(subscription.integration);
+            let mut payload = payload.clone();
+            payload["installation"] = json!({ "id": subscription.installation.id });
+            async move {
+                for attempt in 1..=PR_ATTEMPTS {
+                    match sender.deliver(event, &payload).await {
+                        Ok(()) => return,
+                        Err(e) if attempt == PR_ATTEMPTS => {
+                            tracing::warn!(event, error = %e, attempts = attempt, "github webhook delivery failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(event, error = %e, attempt, "github webhook delivery failed; retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(200 * u64::from(attempt))).await;
+                        }
+                    }
                 }
             }
-        }
+        }).collect();
+        futures::stream::iter(deliveries)
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await;
     });
 }
 
@@ -128,10 +158,6 @@ pub fn urls(cfg: &walgit_config::Config) -> Urls {
     let html = html.trim_end_matches('/').to_string();
     let api = format!("{html}/api/v3");
     Urls { html, api }
-}
-
-fn installation(cfg: &walgit_config::Config) -> Value {
-    json!({ "id": cfg.github.installation_id })
 }
 
 fn sender_user(urls: &Urls) -> Value {
@@ -230,13 +256,15 @@ async fn commit_json(
 pub struct GithubSink {
     state: OnceLock<Weak<AppState>>,
     sender: Sender,
+    installation_id: u64,
 }
 
 impl GithubSink {
-    pub fn new(sender: Sender) -> Self {
+    pub fn new(sender: Sender, installation_id: u64) -> Self {
         GithubSink {
             state: OnceLock::new(),
             sender,
+            installation_id,
         }
     }
 
@@ -265,7 +293,7 @@ impl GithubSink {
         let created = all_zeros(&ev.old);
         let deleted = all_zeros(&ev.new);
         if ev.ref_type == "branch" {
-            let push = self.push_payload(st, &view, &urls, &repository, ev).await?;
+            let push = self.push_payload(&view, &urls, &repository, ev).await?;
             self.sender.deliver("push", &push).await?;
         }
         if created || deleted {
@@ -277,21 +305,19 @@ impl GithubSink {
                 "description": Value::Null,
                 "pusher_type": "user",
                 "repository": repository,
-                "installation": installation(&st.cfg),
+                "installation": json!({ "id": self.installation_id }),
                 "sender": sender_user(&urls),
             });
             self.sender.deliver(event, &payload).await?;
         }
         if ev.ref_type == "branch" && !created && !deleted {
-            self.synchronize_prs(st, &view, &urls, &repository, ev)
-                .await?;
+            self.synchronize_prs(&view, &urls, &repository, ev).await?;
         }
         Ok(())
     }
 
     async fn push_payload(
         &self,
-        st: &Arc<AppState>,
         view: &View,
         urls: &Urls,
         repository: &Value,
@@ -338,7 +364,7 @@ impl GithubSink {
             "base_ref": Value::Null,
             "compare": format!("{}/{full}/compare/{}...{}", urls.html, ev.old, ev.new),
             "repository": repository,
-            "installation": installation(&st.cfg),
+            "installation": json!({ "id": self.installation_id }),
             // The WAL's principal, not the facade's one user: a consumer that
             // attributes a push wants who actually pushed.
             "pusher": {
@@ -356,7 +382,6 @@ impl GithubSink {
     /// actually affected.
     async fn synchronize_prs(
         &self,
-        st: &Arc<AppState>,
         view: &View,
         urls: &Urls,
         repository: &Value,
@@ -386,7 +411,7 @@ impl GithubSink {
                 "synchronize",
                 &pr,
                 &ev.new,
-                &installation(&st.cfg),
+                &json!({ "id": self.installation_id }),
                 &sender_user(urls),
             );
             if let Some(obj) = payload.as_object_mut() {
