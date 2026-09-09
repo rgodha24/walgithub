@@ -1,12 +1,10 @@
 //! The facade's identity: one hardcoded user, admin on everything, and an
 //! OAuth web flow that agrees with the client immediately.
 //!
-//! There is nothing to authenticate against. Whatever a client presents — an
-//! app JWT, an installation token, a user OAuth token, nothing at all — is the
-//! same principal, so the endpoints below hand back credentials that are
-//! constants and permissions that are always `admin`. That is the whole trust
-//! boundary of the facade and the reason `Config::validate` refuses
-//! `github.enabled` off a loopback bind (`docs/GITHUB.md`).
+//! App JWT issuers and synthetic installation tokens select registered
+//! integrations and their repository listings; they are not authenticated.
+//! Repository permissions and the one user's OAuth flow remain development
+//! stubs. The private network is the facade's trust boundary.
 
 use std::sync::Arc;
 
@@ -22,11 +20,6 @@ use crate::AppState;
 /// exists for is the Mintlify server's octokit.
 pub const USER_LOGIN: &str = "mintlify-dev";
 pub const USER_ID: u64 = 1;
-/// The installation every `installationId` in the client's database resolves
-/// to. Any id in the path is accepted; this is what is reported back.
-pub const INSTALLATION_ID: u64 = 1;
-/// The installation token handed out by `access_tokens`. Never checked.
-pub const INSTALLATION_TOKEN: &str = "ghs_dev";
 /// The user token handed out by the OAuth flow. Never checked.
 pub const OAUTH_TOKEN: &str = "gho_dev";
 /// The authorization code the authorize endpoint redirects with.
@@ -57,54 +50,115 @@ pub async fn user_by_login(
 
 /// `GET /api/v3/app` — `html_url` is what `App.getInstallationUrl()` reads to
 /// build the "install this app" link.
-pub async fn app(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn app(State(st): State<Arc<AppState>>, headers: HeaderMap) -> GhResult<Response> {
+    let registry = super::integrations::read(st.registry.store()).await?;
+    let app_id = super::integrations::app_id(&headers)?;
+    let config = &registry
+        .integrations
+        .values()
+        .find(|r| r.config.app_id == app_id)
+        .ok_or_else(|| super::error::GhError::not_found("app"))?
+        .config;
     let urls = Urls::from_request(&st, &headers);
-    axum::Json(models::app(&urls)).into_response()
+    let mut app = models::app(&urls);
+    app["id"] = serde_json::json!(app_id);
+    app["installations_count"] = serde_json::json!(config.installations.len());
+    Ok(axum::Json(app).into_response())
 }
 
-/// `GET /api/v3/app/installations`.
-pub async fn installations(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+/// `GET /api/v3/app/installations`: installations of the JWT issuer's app.
+pub async fn installations(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> GhResult<Response> {
+    let registry = super::integrations::read(st.registry.store()).await?;
+    let app_id = super::integrations::app_id(&headers)?;
+    let config = &registry
+        .integrations
+        .values()
+        .find(|r| r.config.app_id == app_id)
+        .ok_or_else(|| super::error::GhError::not_found("app"))?
+        .config;
     let urls = Urls::from_request(&st, &headers);
-    axum::Json(vec![models::installation(&urls, INSTALLATION_ID)]).into_response()
+    Ok(axum::Json(
+        config
+            .installations
+            .iter()
+            .map(|i| models::installation(&urls, config.app_id, i))
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
 }
 
-/// `GET /api/v3/app/installations/{installation_id}`. Any id, including the
-/// literal `{installationId}` the client sometimes fails to substitute.
+/// Unknown IDs and IDs belonging to another app are not installations of the caller.
 pub async fn installation(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
+    Path(id): Path<u64>,
+) -> GhResult<Response> {
+    let registry = super::integrations::read(st.registry.store()).await?;
+    let (config, install) = registry.installation(id)?;
+    if super::integrations::app_id(&headers)? != config.app_id {
+        return Err(super::error::GhError::not_found("installation"));
+    }
     let urls = Urls::from_request(&st, &headers);
-    let id = id.parse().unwrap_or(INSTALLATION_ID);
-    axum::Json(models::installation(&urls, id)).into_response()
+    Ok(axum::Json(models::installation(&urls, config.app_id, install)).into_response())
 }
 
-/// `DELETE /api/v3/app/installations/{installation_id}` — nothing to delete.
-pub async fn delete_installation() -> StatusCode {
-    StatusCode::NO_CONTENT
-}
-
-/// `POST /api/v3/app/installations/{id}/access_tokens`. `@octokit/auth-app`
-/// reads `token` and `expires_at`; `permissions` and `repository_selection`
-/// are read by the Mintlify server's install checks.
-pub async fn access_tokens(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let urls = Urls::from_request(&st, &headers);
-    (
-        StatusCode::CREATED,
-        axum::Json(models::access_token(&urls)),
+/// Delete is managed through the integration registry, never an accept-and-forget stub.
+pub async fn delete_installation(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> GhResult<StatusCode> {
+    super::integrations::remove_installation(
+        st.registry.store(),
+        super::integrations::app_id(&headers)?,
+        id,
     )
-        .into_response()
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /api/v3/user/installations` — the paginated shape octokit expects.
-pub async fn user_installations(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn access_tokens(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<u64>,
+) -> GhResult<Response> {
+    let registry = super::integrations::read(st.registry.store()).await?;
+    let (config, install) = registry.installation(id)?;
+    if super::integrations::app_id(&headers)? != config.app_id {
+        return Err(super::error::GhError::not_found("installation"));
+    }
     let urls = Urls::from_request(&st, &headers);
-    axum::Json(serde_json::json!({
-        "total_count": 1,
-        "installations": [models::installation(&urls, INSTALLATION_ID)],
-    }))
-    .into_response()
+    Ok((
+        StatusCode::CREATED,
+        axum::Json(models::access_token(&urls, install)),
+    )
+        .into_response())
+}
+
+/// The facade has one user, who can see all registered installations.
+pub async fn user_installations(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> GhResult<Response> {
+    let registry = super::integrations::read(st.registry.store()).await?;
+    let urls = Urls::from_request(&st, &headers);
+    let installations: Vec<_> = registry
+        .integrations
+        .values()
+        .flat_map(|r| {
+            r.config
+                .installations
+                .iter()
+                .map(|i| models::installation(&urls, r.config.app_id, i))
+        })
+        .collect();
+    Ok(axum::Json(
+        serde_json::json!({ "total_count": installations.len(), "installations": installations }),
+    )
+    .into_response())
 }
 
 /// `GET /api/v3/repos/{o}/{r}/collaborators/{u}/permission` — always `admin`.

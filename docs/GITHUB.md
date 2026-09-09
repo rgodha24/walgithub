@@ -9,18 +9,21 @@ octokit with it — needs no new code to develop against walgit: point that `bas
 `http://<walgit-host>/api/v3` and it reads real refs, commits and objects out of the bucket, and its writes
 go through walgit's publish path.
 
-It exists for exactly one workflow: a developer running walgit and their application on one machine. It is
-**never deployed**. There are no rate limits, no GitHub App to register, no webhook secrets and — the point
-below — no authentication at all.
+It serves local development and private editor E2Es. There are no rate limits and no authentication;
+the private network is the trust boundary. Its app integrations and signed callbacks are registered in
+the facade rather than at github.com.
 
 ## 1. Trust boundary: there isn't one
 
 Every route under `/api/v3`, `/api/graphql` and `/login/oauth` **bypasses `server.auth`**:
 
-- any bearer, JWT, installation token or nothing at all is accepted, and resolves to one hardcoded user
-  (`login = mintlify-dev`, `id = 1`);
+- repository access resolves to one hardcoded user (`login = mintlify-dev`, `id = 1`), regardless of bearer;
+- app identity endpoints use the JWT's numeric `iss` to select a registered app (without verifying its
+  signature). Unknown apps/installations fail instead of selecting a different integration;
 - `…/collaborators/{u}/permission` always answers `admin`, for every user and every repository;
-- `POST /api/v3/app/installations/{id}/access_tokens` hands out the constant `ghs_dev`;
+- `POST /api/v3/app/installations/{id}/access_tokens` hands out `ghs_walgit_<id>` for a registered
+  installation of the calling app. `GET /installation/repositories` uses that token to filter its owner
+  and selected repositories. Tokens are routing identifiers, not an access-control boundary;
 - `GET /login/oauth/authorize` redirects straight back with `code=dev` — there is no consent form because
   there is nothing to consent to;
 - the facade is admin on every repository in the bucket, including delete-a-ref.
@@ -34,9 +37,6 @@ beyond loopback (a compose network, say) — the network the process sits on is 
 ```toml
 [github]
 enabled = true          # default false; docs/GITHUB.md
-# webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"   # §11
-# webhook_secret = "…"
-# installation_id = 1
 # webhook_poll_interval = "1s"
 
 [server]
@@ -449,7 +449,7 @@ when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` run
 whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.
 
 `scripts/github-smoke.mjs` is the client-side check: the real `octokit` package (App JWT →
-installation token, REST, GraphQL) against a running facade. Point it at a server with
+installation token, REST, GraphQL) against a running facade. Register app ID 1 / installation ID 1 for owner `mintlify` first (§11). Point it at a server with
 `mintlify/editor-e2e` pushed in (edit `owner`/`repo`/`baseUrl` at the top otherwise), run it from a
 directory whose `node_modules` has `octokit` (`ln -s <app>/node_modules`), and it walks 28 steps:
 reads, `createCommitOnBranch` including the stale-head error, compare, a PR opened, reviewed, commented
@@ -460,20 +460,56 @@ on and merged, `commits/{sha}/pulls`, and a check-run created then patched.
 The facade delivers GitHub-shaped webhooks so a GitHub App backend deploys on a `git push` the way it does
 against real GHES. `docs/GITHUB_SHAPES.md` §"Tier 5 — Webhooks" is the contract; this is how it is produced.
 
-### 11.1 Configuration
+### 11.1 Integrations and registration
 
-```toml
-[github]
-enabled = true
-webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"   # unset = no webhooks
-webhook_secret = "a-shared-secret"   # unset = unsigned, which every GitHub client rejects
-installation_id = 1                  # default 1; `installation.id` in every payload
-webhook_poll_interval = "1s"         # default 1s; 0 = fall back to events.sweep_interval
+`[github] enabled = true` enables the facade and its events bridge. The only webhook setting in the
+server config is `webhook_poll_interval = "1s"` (`0` uses `events.sweep_interval`). App settings live in
+the object store, updated through the private facade:
+
+- `PUT /api/v3/_dev/integrations/{name}` creates or replaces a named integration atomically.
+- `GET /api/v3/_dev/integrations` and `GET .../{name}` return configuration **without secrets**.
+- `DELETE /api/v3/_dev/integrations/{name}` removes its subscriptions.
+
+Example PUT body (send from a private setup script; do not print or commit the real secret):
+
+```json
+{
+  "app_id": 101,
+  "webhook_url": "https://example.com/github-enterprise/e2etest",
+  "webhook_secret": "<random-shared-secret>",
+  "installations": [
+    {"id": 1001, "owner": "editor-e2e", "repository_selection": "all", "repositories": []}
+  ]
+}
 ```
 
-`webhook_url` must be http(s) (`Config::validate`). It is **independent of `[events] webhook_url`**: the
-walgit-native array webhook (`docs/EVENTS.md`) keeps its own shape and its own secret, and both sinks see
-every batch when both are configured.
+An integration models a GitHub App: one callback and shared signing secret across its installations.
+App IDs and installation IDs must be positive and globally unique. An app may have one installation per
+owner, or no installations yet. `repository_selection: "all"` includes present and future repositories
+under that owner, so disposable E2E repositories need no reconfiguration. With `"selected"`, supply names
+in `repositories`, e.g. `["docs", "docs-next"]`; an empty selected list subscribes nothing. Two different
+apps may subscribe to the same repository, each receiving its own signed delivery and installation ID.
+PUT is a complete replacement, including the secret. Successful reads return
+`webhook_secret_configured: true` instead of the secret.
+
+The registry is one CAS'd `github/integrations.json` object under the configured store prefix. **Its
+contents include shared secrets**: use a private encrypted bucket and scoped IAM. This does not avoid
+secret-handling policies or audit logging. `_dev` management has the same private-network trust boundary
+as the rest of this auth-free facade; it is not a public administration API. No request path logs secrets,
+and registry parse/validation errors fail delivery rather than silently treating configuration as absent.
+
+Registration changes are read on the next delivery/identity request and need no facade restart. Point
+the backend GHES app record at the facade origin and configure matching app ID, installation ID and
+webhook secret. Mintlify's backend mounts GHES webhook routes at startup, so **adding a new backend GHES
+record still requires a backend restart**. Its owner-to-installation lookup selects the first matching
+owner within an org: use distinct owners for separate E2E integrations in the same backend org. Existing
+hosted dashboard login stays unchanged.
+
+App endpoints read the unverified JWT `iss`; installation-token responses and lists reflect that app's
+registered installations. The installation token restricts `/installation/repositories` listing only;
+the rest of the facade retains its documented auth-free permission model.
+
+The walgit-native `[events]` webhook keeps its independent format, secret and durable cursor.
 
 **Roles.** The producer is the events bridge, which runs under `Role::Events` — and `has_role` answers true
 for every role when `server.roles` is empty, which is the default. So a standalone facade needs **no `roles`
@@ -503,23 +539,32 @@ WAL entry's principal, which is who actually pushed.
 `installation`, `sender` and `pusher_type: "user"`.
 
 Every delivery is one JSON body with `content-type: application/json`, `x-github-event`,
-`x-github-delivery` (uuid v4), `user-agent: GitHub-Hookshot/walgit` and, with a secret configured,
+`x-github-delivery` (uuid v4), `user-agent: GitHub-Hookshot/walgit` and, always
 `x-hub-signature-256: sha256=<hex HMAC-SHA256 of the raw body>` — the same HMAC the walgit-native signature
 uses, under GitHub's header name.
 
 ### 11.3 Where they come from, and the latency
 
-**Ref deliveries are readers of the WAL, never steps of a write** (principle III). `github::webhook::GithubSink`
-is a `crate::events::Sink` on the bridge, so a delivery happens iff the entry is durable, a non-2xx or a
-timeout leaves the cursor where it was and the batch is retried, and a down consumer adds **zero**
-milliseconds to receive-pack. Delivery is therefore at-least-once.
+**Ref deliveries are readers of the WAL, never steps of a write** (principle III). Each matched
+installation gets a `GithubSink` and a durable per-repo cursor at `github/events/<generation>.json`.
+A non-2xx or timeout leaves only that target's cursor untouched; other targets advance independently.
+Catch-ups lock per repo/target, the sweep processes up to 16 repos concurrently, and senders reuse HTTP
+connections. A down consumer adds **zero** milliseconds to receive-pack. Delivery is at-least-once;
+delivery UUIDs are generated separately for each HTTP attempt, including each fanout target.
+
+New installations and changed repository selections get a new persisted generation. Their first pass
+replays the oldest retained WAL entries, including existing repos in a changed selection. Deleting and
+recreating an installation cannot inherit its old cursor. Unchanged selections and secret/callback-only
+updates preserve cursors. Register before seeding to avoid unexpected historical backfill; callbacks
+must tolerate duplicates. WAL retention gaps remain explicit warnings/metrics as in `docs/EVENTS.md`.
+One events host remains the supported deployment: running overlapping hosts can produce duplicates.
 
 Two wake-ups reach it here:
 
 - **A write on this instance wakes it directly.** `smart.rs` (receive-pack) and `github::events::ref_written`
-  (every facade write) call `Bridge::wake`, which spawns a `catch_up`. Measured in
-  `tests/github_webhooks.rs`: a `git push` to a delivered, signed `push` in **~20–25 ms**.
-  This wake exists only when `github.webhook_url` is set — the walgit-native bus keeps exactly the two
+  (every facade write) call `Bridge::wake`, which spawns a `catch_up`. Measured locally with the in-memory store in
+  `tests/github_webhooks.rs` (not an S3 latency claim): a `git push` to a delivered, signed `push` in **~20–25 ms**.
+  This wake exists whenever `github.enabled` is true — the walgit-native bus keeps exactly the two
   wake-ups `docs/EVENTS.md` promises, because a production bridge is a separate service and must not depend
   on sharing a process with a writer.
 - **The sweep polls.** S3/MinIO buckets in development emit no notifications, so the sweep is the primary

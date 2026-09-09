@@ -19,12 +19,13 @@
 //!   that finds unpublished entries means the notifications are not flowing
 //!   and says so (`events_bridge_sweep_found_total`, warn).
 //!
-//! One instance of the service; catch-ups are serialized (volume is tiny).
+//! One instance of the service; catch-ups serialize per repository and target.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Context;
 use chrono::Utc;
+use futures::StreamExt;
 use walgit_git::RepoId;
 use walgit_store::{ObjectStoreExt, PutMode, StoreError};
 
@@ -63,7 +64,8 @@ pub struct Bridge {
     /// directly, and a sweep that finds work is the design rather than an
     /// alarm — a dev bucket has no notifications to be missing.
     github_sink: bool,
-    serial: tokio::sync::Mutex<()>,
+    state: OnceLock<Weak<crate::AppState>>,
+    serial: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Bridge {
@@ -86,11 +88,8 @@ impl Bridge {
         // The GitHub facade's own sink (`docs/GITHUB.md` §Webhooks): the same
         // WAL entries, rendered as GitHub `push` / `create` / `delete`
         // deliveries. Independent of the walgit-native array webhook above.
-        let github_sink = cfg.github.webhook_url.is_some();
-        if let Some(sender) = crate::github::webhook::Sender::from_cfg(cfg) {
-            sinks.push(Box::new(crate::github::webhook::GithubSink::new(sender)));
-        }
-        if sinks.is_empty() {
+        let github_sink = cfg.github.enabled;
+        if sinks.is_empty() && !github_sink {
             return None;
         }
         tracing::info!(
@@ -102,13 +101,15 @@ impl Bridge {
             store_prefix: cfg.store_prefix(),
             sinks,
             github_sink,
-            serial: tokio::sync::Mutex::new(()),
+            state: OnceLock::new(),
+            serial: dashmap::DashMap::new(),
         }))
     }
 
     /// Hand every sink the instance it belongs to. Called once, right after
     /// the `AppState` Arc exists.
     pub fn attach_state(&self, st: &Arc<crate::AppState>) {
+        let _ = self.state.set(Arc::downgrade(st));
         for sink in &self.sinks {
             sink.attach_state(st);
         }
@@ -137,7 +138,79 @@ impl Bridge {
 
     /// Publish everything committed after the cursor, then advance it.
     pub async fn catch_up(&self, id: &RepoId) -> anyhow::Result<CatchUp> {
-        let _serial = self.serial.lock().await;
+        let native = async {
+            if self.sinks.is_empty() {
+                return Ok(None);
+            }
+            self.catch_up_target(id, CURSOR_KEY, None).await.map(Some)
+        };
+        let github = self.catch_up_github(id);
+        let (native, github) = tokio::join!(native, github);
+        // Every target ran even if another failed. Only its own cursor can
+        // advance, so a retry never replays a successful target's batch.
+        let mut report = native?;
+        for next in github? {
+            if let Some(current) = &mut report {
+                current.from_seq = current.from_seq.min(next.from_seq);
+                current.head_seq = current.head_seq.max(next.head_seq);
+                current.emitted += next.emitted;
+                current.gap = current.gap.or(next.gap);
+            } else {
+                report = Some(next);
+            }
+        }
+        Ok(report.unwrap_or_else(|| CatchUp {
+            repo: id.to_string(),
+            ..CatchUp::default()
+        }))
+    }
+
+    async fn catch_up_github(&self, id: &RepoId) -> anyhow::Result<Vec<CatchUp>> {
+        if !self.github_sink {
+            return Ok(Vec::new());
+        }
+        let st = self
+            .state
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| anyhow::anyhow!("GitHub bridge has no server state"))?;
+        let registry = crate::github::integrations::read(self.registry.store())
+            .await
+            .map_err(|_| anyhow::anyhow!("could not read GitHub integrations"))?;
+        let targets: Vec<_> = registry
+            .subscriptions(id)
+            .map_err(|_| anyhow::anyhow!("invalid GitHub subscriptions"))?
+            .into_iter()
+            .map(|subscription| {
+                let sink = crate::github::webhook::GithubSink::new(
+                    crate::github::webhook::Sender::new(subscription.integration),
+                    subscription.installation.id,
+                );
+                sink.attach_state(&st);
+                let key = format!("github/events/{}.json", subscription.generation);
+                async move { self.catch_up_target(id, &key, Some(&sink)).await }
+            })
+            .collect();
+        futures::stream::iter(targets)
+            .buffer_unordered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    async fn catch_up_target(
+        &self,
+        id: &RepoId,
+        cursor_key: &str,
+        github: Option<&crate::github::webhook::GithubSink>,
+    ) -> anyhow::Result<CatchUp> {
+        let serial = self
+            .serial
+            .entry(format!("{id}/{cursor_key}"))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _serial = serial.lock().await;
         let handle = self.registry.open(id).await?;
         let manifest = {
             let guard = handle.sync_refs().await?;
@@ -152,7 +225,7 @@ impl Bridge {
         let readable_from = manifest.min_seq.saturating_sub(1);
         let store = handle.store();
 
-        let (cursor, version) = match store.get_bytes(CURSOR_KEY).await? {
+        let (cursor, version) = match store.get_bytes(cursor_key).await? {
             Some((meta, bytes)) => {
                 let c: Cursor = serde_json::from_slice(&bytes).context("events/cursor.json")?;
                 (Some(c.published_seq), Some(meta.version))
@@ -185,7 +258,13 @@ impl Bridge {
             events::refs_from_entries(id, &entries, &mut batch);
             // A failing sink returns here: cursor untouched, retried on the
             // next wake-up.
-            self.publish(&batch).await?;
+            if let Some(sink) = github {
+                sink.deliver(&batch).await?;
+                metrics::counter!("events_published_total", "sink" => "github")
+                    .increment(batch.len() as u64);
+            } else {
+                self.publish(&batch).await?;
+            }
             report.emitted = batch.len();
         }
 
@@ -198,7 +277,7 @@ impl Bridge {
                 Some(v) => PutMode::Update(v),
                 None => PutMode::Create,
             };
-            match store.put_bytes(CURSOR_KEY, body, mode).await {
+            match store.put_bytes(cursor_key, body, mode).await {
                 Ok(_) => {}
                 // Another bridge instance advanced it: our emission was a
                 // duplicate (dedup key), theirs stands.
@@ -227,8 +306,13 @@ impl Bridge {
                 return;
             }
         };
-        for id in repos {
-            match self.catch_up(&id).await {
+        let mut passes = futures::stream::iter(repos.into_iter().map(|id| async move {
+            let result = self.catch_up(&id).await;
+            (id, result)
+        }))
+        .buffer_unordered(16);
+        while let Some((id, result)) = passes.next().await {
+            match result {
                 Ok(c) if c.emitted > 0 => {
                     metrics::counter!("events_bridge_sweep_found_total")
                         .increment(c.emitted as u64);
@@ -246,6 +330,9 @@ impl Bridge {
                 }
             }
         }
+        // Entries are held while a catch-up owns/waits for its mutex. Retain
+        // those; obsolete disposable-repo/generation locks can be reclaimed.
+        self.serial.retain(|_, lock| Arc::strong_count(lock) > 1);
     }
 
     /// A GCS notification: `…/repos/<o>/<r>/manifest.pb` finalized ⇒ that
@@ -409,7 +496,7 @@ pub fn spawn_sweeper(state: Arc<crate::AppState>) {
         return;
     };
     let mut every = state.cfg.events.sweep_interval;
-    if state.cfg.github.webhook_url.is_some() {
+    if state.cfg.github.enabled {
         let poll = state.cfg.github.webhook_poll_interval;
         if !poll.is_zero() && (every.is_zero() || poll < every) {
             every = poll;
@@ -440,7 +527,8 @@ mod tests {
             store_prefix: "prefix/".into(),
             sinks: Vec::new(),
             github_sink: false,
-            serial: tokio::sync::Mutex::new(()),
+            state: OnceLock::new(),
+            serial: dashmap::DashMap::new(),
         };
         let id = b
             .manifest_repo("prefix/repos/acme/monorepo/manifest.pb")

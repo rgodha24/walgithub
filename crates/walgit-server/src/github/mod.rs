@@ -44,6 +44,7 @@ pub mod diff;
 pub mod error;
 pub mod events;
 pub mod graphql;
+pub mod integrations;
 pub mod merge;
 pub mod models;
 pub mod pr_store;

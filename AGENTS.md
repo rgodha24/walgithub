@@ -457,6 +457,15 @@ repository. Infrastructure selects the resulting digest separately. See `docs/RE
 `deploy/walgithub.toml`; facade behavior changes ship with its release. Pulumi supplies only
 AWS resource bindings (bucket, region, private origin, and injected webhook secret).
 
+**D46 — Dynamic GitHub App integrations (2026-09-09).** Replaces D42's global GitHub callback/secret/
+installation config with `github/integrations.json`, a CAS'd bucket registry managed by the private
+`/api/v3/_dev/integrations` API. One app callback/secret spans registered installations, each selecting
+all or named repos under one owner. Reads redact secrets; the bucket contains them. WAL deliveries use
+separate cursors per installation generation/repo; changing selection replays retained history, and
+failure never advances another target's cursor. App JWT issuer and synthetic installation tokens select
+registered identity/listing, without introducing authentication. PR events remain best effort.
+`docs/GITHUB.md` §11 and `docs/ROUNDTRIPS.md` own the contract and cost model.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

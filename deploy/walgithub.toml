@@ -1,5 +1,5 @@
 # Runtime defaults for the private editor E2E facade image.
-# ECS supplies the bucket, region, private origin, and webhook secret.
+# ECS supplies the bucket, region, private origin. Integrations are registered through the private _dev API.
 [server]
 listen = "0.0.0.0:8097"
 auto_create_on_push = true
@@ -12,9 +12,7 @@ mode = "off"
 
 [github]
 enabled = true
-webhook_url = "https://example.com/github-enterprise/e2etest"
 webhook_poll_interval = "1s"
-installation_id = 1
 
 [store]
 backend = "s3"

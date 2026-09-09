@@ -368,9 +368,6 @@ pub(super) fn emit_for(
     action: &'static str,
     pr: &PullRequest,
 ) {
-    if st.cfg.github.webhook_url.is_none() {
-        return;
-    }
     let head_sha = live_head(view, pr);
     let payload = event_payload(
         view,
@@ -379,7 +376,7 @@ pub(super) fn emit_for(
         action,
         pr,
         &head_sha,
-        &json!({ "id": st.cfg.github.installation_id }),
+        &Value::Null,
         &serde_json::to_value(models::named_user(urls, super::auth::USER_LOGIN))
             .unwrap_or(Value::Null),
     );
@@ -747,7 +744,7 @@ async fn patch_pull(
             ));
         }
     }
-    let before = if st.cfg.github.webhook_url.is_some() {
+    let before = if st.cfg.github.enabled {
         pr_store::try_read(&ctx.store, number).await?
     } else {
         None

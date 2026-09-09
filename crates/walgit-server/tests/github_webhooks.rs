@@ -39,7 +39,17 @@ fn sign(secret: &[u8], body: &[u8]) -> String {
 
 /// The consumer: reads the raw body (there is no JSON body parser in front of
 /// octokit's middleware either) and records what arrived.
+#[derive(Clone)]
+struct Control {
+    permits: Arc<tokio::sync::Semaphore>,
+    failing: Arc<std::sync::atomic::AtomicBool>,
+}
+
 async fn receiver() -> (String, Captured) {
+    receiver_control(None).await
+}
+
+async fn receiver_control(control: Option<Control>) -> (String, Captured) {
     let captured: Captured = Captured::default();
     let app = axum::Router::new().route(
         "/github-enterprise/acme",
@@ -47,6 +57,7 @@ async fn receiver() -> (String, Captured) {
             let captured = captured.clone();
             move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
                 let captured = captured.clone();
+                let control = control.clone();
                 async move {
                     let header = |n: &str| {
                         headers
@@ -63,6 +74,12 @@ async fn receiver() -> (String, Captured) {
                         body: body.to_vec(),
                         payload: serde_json::from_slice(&body).unwrap_or(Value::Null),
                     });
+                    if let Some(control) = control {
+                        control.permits.acquire().await.expect("permit").forget();
+                        if control.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                        }
+                    }
                     axum::http::StatusCode::OK
                 }
             }
@@ -79,16 +96,43 @@ async fn receiver() -> (String, Captured) {
 }
 
 async fn server(url: &str) -> anyhow::Result<Server> {
-    let url = url.to_string();
-    Server::start_with_tweak(move |cfg| {
+    let s = Server::start_with_tweak(|cfg| {
         cfg.github.enabled = true;
-        cfg.github.webhook_url = Some(url);
-        cfg.github.webhook_secret = Some(SECRET.into());
-        cfg.github.installation_id = INSTALLATION;
         cfg.github.webhook_poll_interval = Duration::from_millis(200);
         cfg.server.auto_create_on_push = true;
     })
-    .await
+    .await?;
+    register(&s, "acme", 1, INSTALLATION, "acme", url, SECRET, None).await?;
+    Ok(s)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn register(
+    s: &Server,
+    name: &str,
+    app: u64,
+    installation: u64,
+    owner: &str,
+    url: &str,
+    secret: &str,
+    repositories: Option<Vec<&str>>,
+) -> TestResult {
+    let result = reqwest::Client::new()
+        .put(api(s, &format!("/_dev/integrations/{name}")))
+        .json(
+            &serde_json::json!({"app_id":app, "webhook_url":url, "webhook_secret":secret,
+            "installations":[{"id":installation,"owner":owner,
+                "repository_selection":if repositories.is_some() {"selected"} else {"all"},
+                "repositories":repositories.unwrap_or_default()}]}),
+        )
+        .send()
+        .await?;
+    anyhow::ensure!(
+        result.status().is_success(),
+        "registration failed: {}",
+        result.text().await?
+    );
+    Ok(())
 }
 
 /// The first delivery matching `event` + `pred`, or a panic with everything
@@ -347,5 +391,355 @@ async fn pull_request_open_synchronize_and_merge_deliver() -> TestResult {
     println!("merge push delivered in {latency:?}");
     assert_eq!(d.payload["created"], false);
     assert!(d.payload["size"].as_u64().unwrap_or(0) >= 1);
+    Ok(())
+}
+
+fn app_token(id: u64) -> String {
+    use base64::Engine;
+    format!(
+        "e30.{}.dev",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{{\"iss\":\"{id}\"}}"))
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integrations_route_pushes_and_prs_with_distinct_secrets_and_survive_restart() -> TestResult
+{
+    let (url_a, a) = receiver().await;
+    let (url_b, b) = receiver().await;
+    let (url_c, c) = receiver().await;
+    let s = server(&url_a).await?;
+    register(
+        &s,
+        "overlap",
+        2,
+        200,
+        "acme",
+        &url_b,
+        "secret-b",
+        Some(vec!["docs"]),
+    )
+    .await?;
+    register(&s, "other", 3, 300, "other", &url_c, "secret-c", None).await?;
+    let (_tmp, dir) = fixture(&s)?;
+    commit_in(&dir, "docs.json", "{}", "seed")?;
+    git_in(&dir, &["push", "-q", "origin", "main"])?;
+    let (da, _) = wait_for(&a, "push", |p| p["ref"] == "refs/heads/main").await;
+    let (db, _) = wait_for(&b, "push", |p| p["ref"] == "refs/heads/main").await;
+    assert_eq!(da.signature, sign(SECRET.as_bytes(), &da.body));
+    assert_eq!(db.signature, sign(b"secret-b", &db.body));
+    assert_eq!(db.payload["installation"]["id"], 200);
+    assert_ne!(da.delivery, db.delivery);
+    assert!(c.lock().unwrap().is_empty());
+
+    git_in(&dir, &["checkout", "-q", "-b", "feature"])?;
+    commit_in(&dir, "page.mdx", "hello", "page")?;
+    git_in(&dir, &["push", "-q", "origin", "feature"])?;
+    reqwest::Client::new()
+        .post(api(&s, "/repos/acme/docs/pulls"))
+        .json(&serde_json::json!({"title":"test", "head":"feature", "base":"main"}))
+        .send()
+        .await?
+        .error_for_status()?;
+    let (pa, _) = wait_for(&a, "pull_request", |p| p["action"] == "opened").await;
+    let (pb, _) = wait_for(&b, "pull_request", |p| p["action"] == "opened").await;
+    assert_eq!(pa.payload["installation"]["id"], INSTALLATION);
+    assert_eq!(pb.payload["installation"]["id"], 200);
+    assert_eq!(pb.signature, sign(b"secret-b", &pb.body));
+    assert_ne!(pa.delivery, pb.delivery);
+    assert!(c.lock().unwrap().is_empty());
+    let id = "acme/docs".parse()?;
+    s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+
+    let store = s.store.clone();
+    drop(s);
+    let s = Server::start_with_store_and_tweak(store, |cfg| {
+        cfg.github.enabled = true;
+        cfg.server.auto_create_on_push = true;
+    })
+    .await?;
+    let before = (a.lock().unwrap().len(), b.lock().unwrap().len());
+    s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+    assert_eq!(
+        before,
+        (a.lock().unwrap().len(), b.lock().unwrap().len()),
+        "restart reuses each durable cursor"
+    );
+    git_in(
+        &dir,
+        &["remote", "set-url", "origin", &s.repo_url("acme", "docs")],
+    )?;
+    commit_in(&dir, "page.mdx", "updated", "update")?;
+    let next = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
+    git_in(&dir, &["push", "-q", "origin", "feature"])?;
+    wait_for(&a, "pull_request", |p| {
+        p["action"] == "synchronize" && p["after"] == next
+    })
+    .await;
+    let (sync, _) = wait_for(&b, "pull_request", |p| {
+        p["action"] == "synchronize" && p["after"] == next
+    })
+    .await;
+    assert_eq!(sync.signature, sign(b"secret-b", &sync.body));
+
+    // An all-repositories installation automatically subscribes a new repo;
+    // a selected installation on the same owner does not receive its events.
+    git_in(
+        &dir,
+        &["push", "-q", &s.repo_url("acme", "new-docs"), "HEAD:main"],
+    )?;
+    s.state
+        .bridge
+        .as_ref()
+        .unwrap()
+        .catch_up(&"acme/new-docs".parse()?)
+        .await?;
+    wait_for(&a, "push", |p| {
+        p["repository"]["full_name"] == "acme/new-docs"
+    })
+    .await;
+    assert!(
+        !b.lock()
+            .unwrap()
+            .iter()
+            .any(|d| d.payload["repository"]["full_name"] == "acme/new-docs")
+    );
+
+    // Adding/removing selected repos takes effect through the registry, without
+    // another server. Changed selection gets its own retained-history replay.
+    register(
+        &s,
+        "overlap",
+        2,
+        200,
+        "acme",
+        &url_b,
+        "secret-b",
+        Some(vec!["new-docs"]),
+    )
+    .await?;
+    s.state
+        .bridge
+        .as_ref()
+        .unwrap()
+        .catch_up(&"acme/new-docs".parse()?)
+        .await?;
+    wait_for(&b, "push", |p| {
+        p["repository"]["full_name"] == "acme/new-docs"
+    })
+    .await;
+    let before = b.lock().unwrap().len();
+    commit_in(&dir, "page.mdx", "last", "last update")?;
+    git_in(&dir, &["push", "-q", "origin", "feature"])?;
+    s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+    assert_eq!(b.lock().unwrap().len(), before);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_failed_integration_cannot_block_other_repos_or_advance_its_cursor() -> TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (url, healthy) = receiver().await;
+    let control = Control {
+        permits: Arc::new(tokio::sync::Semaphore::new(0)),
+        failing: Arc::new(AtomicBool::new(true)),
+    };
+    let (bad_url, failed) = receiver_control(Some(control.clone())).await;
+    let s = server(&url).await?;
+    register(&s, "slow", 2, 200, "acme", &bad_url, "slow-secret", None).await?;
+    let (_tmp, dir) = fixture(&s)?;
+    commit_in(&dir, "docs.json", "{}", "seed")?;
+    git_in(&dir, &["push", "-q", "origin", "main"])?;
+    wait_for(&failed, "push", |p| {
+        p["repository"]["full_name"] == "acme/docs"
+    })
+    .await;
+    wait_for(&healthy, "push", |p| {
+        p["repository"]["full_name"] == "acme/docs"
+    })
+    .await;
+    // The first receiver is still stalled. A different repo must deliver now.
+    git_in(
+        &dir,
+        &["push", "-q", &s.repo_url("acme", "second"), "HEAD:main"],
+    )?;
+    let (_, latency) = wait_for(&healthy, "push", |p| {
+        p["repository"]["full_name"] == "acme/second"
+    })
+    .await;
+    assert!(latency < Duration::from_secs(2));
+    control.permits.add_permits(100);
+    let id = "acme/docs".parse()?;
+    assert!(
+        s.state
+            .bridge
+            .as_ref()
+            .unwrap()
+            .catch_up(&id)
+            .await
+            .is_err()
+    );
+    let healthy_before = healthy.lock().unwrap().len();
+    let failed_before = failed.lock().unwrap().len();
+    control.failing.store(false, Ordering::SeqCst);
+    s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+    assert_eq!(
+        healthy.lock().unwrap().len(),
+        healthy_before,
+        "successful target was replayed"
+    );
+    assert!(
+        failed.lock().unwrap().len() > failed_before,
+        "failed cursor skipped its events"
+    );
+    let failed_before = failed.lock().unwrap().len();
+    s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+    assert_eq!(
+        failed.lock().unwrap().len(),
+        failed_before,
+        "acknowledged target replayed"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integration_identity_redaction_validation_and_last_installation_delete() -> TestResult {
+    use walgit_store::{ObjectStoreExt, PutMode};
+    let (url, _) = receiver().await;
+    let s = server(&url).await?;
+    register(
+        &s,
+        "other",
+        2,
+        200,
+        "other",
+        &url,
+        "private-secret-two",
+        None,
+    )
+    .await?;
+    let client = reqwest::Client::new();
+    let list = client
+        .get(api(&s, "/_dev/integrations"))
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(!list.contains(SECRET) && !list.contains("private-secret-two"));
+    assert!(list.contains("webhook_secret_configured"));
+    let apps: Value = client
+        .get(api(&s, "/app/installations"))
+        .bearer_auth(app_token(2))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    assert_eq!(apps[0]["id"], 200);
+    assert_eq!(apps[0]["app_id"], 2);
+    assert_eq!(apps[0]["account"]["login"], "other");
+    assert_eq!(
+        client
+            .post(api(&s, "/app/installations/200/access_tokens"))
+            .bearer_auth(app_token(1))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        client
+            .get(api(&s, "/app/installations/999"))
+            .bearer_auth(app_token(2))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let token: Value = client
+        .post(api(&s, "/app/installations/200/access_tokens"))
+        .bearer_auth(app_token(2))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(token["installation"]["id"], 200);
+    let (_tmp, dir) = fixture(&s)?;
+    commit_in(&dir, "docs.json", "{}", "seed")?;
+    git_in(&dir, &["push", "-q", "origin", "main"])?;
+    let repos: Value = client
+        .get(api(&s, "/installation/repositories"))
+        .bearer_auth(token["token"].as_str().unwrap())
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(
+        repos["total_count"], 0,
+        "other installation listed acme repo"
+    );
+    let duplicate = client
+        .put(api(&s, "/_dev/integrations/duplicate"))
+        .json(
+            &serde_json::json!({"app_id":3,"webhook_url":url,"webhook_secret":"never-in-errors",
+            "installations":[{"id":200,"owner":"third","repository_selection":"all"}]}),
+        )
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+    assert!(!duplicate.text().await?.contains("never-in-errors"));
+    client
+        .delete(api(&s, "/app/installations/200"))
+        .bearer_auth(app_token(2))
+        .send()
+        .await?
+        .error_for_status()?;
+    let apps: Value = client
+        .get(api(&s, "/app/installations"))
+        .bearer_auth(app_token(2))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(apps.as_array().unwrap().is_empty());
+    client
+        .get(api(&s, "/_dev/integrations"))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Corrupt metadata is an error, never a missing-subscriber interpretation
+    // that acknowledges and silently drops retained events.
+    let store = s.state.registry.store();
+    let (_, bytes) = store.get_bytes("github/integrations.json").await?.unwrap();
+    let mut corrupted: Value = serde_json::from_slice(&bytes)?;
+    corrupted["integrations"]["acme"]["generations"] = serde_json::json!({});
+    store
+        .put_bytes(
+            "github/integrations.json",
+            serde_json::to_vec(&corrupted)?,
+            PutMode::Overwrite,
+        )
+        .await?;
+    assert!(
+        s.state
+            .bridge
+            .as_ref()
+            .unwrap()
+            .catch_up(&"acme/docs".parse()?)
+            .await
+            .is_err()
+    );
+    let response = client.get(api(&s, "/_dev/integrations")).send().await?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!response.text().await?.contains(SECRET));
     Ok(())
 }

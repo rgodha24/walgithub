@@ -34,6 +34,13 @@ use crate::AppState;
 /// Mount the facade. Called from `crate::router` only when `github.enabled`.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/api/v3/_dev/integrations", get(super::integrations::list))
+        .route(
+            "/api/v3/_dev/integrations/{name}",
+            get(super::integrations::get)
+                .put(super::integrations::put)
+                .delete(super::integrations::delete),
+        )
         .route("/api/v3/app", get(auth::app))
         .route("/api/v3/app/installations", get(auth::installations))
         .route(
@@ -52,14 +59,23 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/v3/user/installations", get(auth::user_installations))
         .route("/api/v3/users/{login}", get(auth::user_by_login))
         .route("/api/v3/rate_limit", get(auth::rate_limit))
-        .route("/api/v3/applications/{client_id}/grant", delete(auth::revoke))
-        .route("/api/v3/applications/{client_id}/token", delete(auth::revoke))
+        .route(
+            "/api/v3/applications/{client_id}/grant",
+            delete(auth::revoke),
+        )
+        .route(
+            "/api/v3/applications/{client_id}/token",
+            delete(auth::revoke),
+        )
         .route("/api/v3/repos/{owner}/{repo}", get(repo::get_repo))
         .route(
             "/api/v3/repos/{owner}/{repo}/collaborators/{username}/permission",
             get(auth::collaborator_permission),
         )
-        .route("/api/v3/repos/{owner}/{repo}/commits", get(repo::list_commits))
+        .route(
+            "/api/v3/repos/{owner}/{repo}/commits",
+            get(repo::list_commits),
+        )
         .route(
             "/api/v3/repos/{owner}/{repo}/commits/{*ref}",
             get(super::prs::commit_or_subroute),
@@ -116,7 +132,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/v3/repos/{owner}/{repo}/compare/{*basehead}",
             get(compare::compare),
         )
-        .route("/api/v3/repos/{owner}/{repo}/readme", get(reads::get_readme))
+        .route(
+            "/api/v3/repos/{owner}/{repo}/readme",
+            get(reads::get_readme),
+        )
         .route(
             "/api/v3/repos/{owner}/{repo}/zipball",
             get(reads::zipball_default),
@@ -165,10 +184,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 /// (they are read off responses rather than from `/rate_limit`) and the
 /// request id a client puts in its own error logs. Nothing here is limited,
 /// so the numbers never move.
-async fn rate_limit_headers(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
+async fn rate_limit_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let mut resp = next.run(req).await;
     if let Ok(v) = axum::http::HeaderValue::from_str(&uuid::Uuid::new_v4().to_string()) {
         resp.headers_mut().insert(
@@ -189,10 +205,7 @@ async fn rate_limit_headers(
         );
     }
     if let Ok(v) = axum::http::HeaderValue::from_str(&(auth::now_secs() + 3600).to_string()) {
-        h.insert(
-            axum::http::HeaderName::from_static("x-ratelimit-reset"),
-            v,
-        );
+        h.insert(axum::http::HeaderName::from_static("x-ratelimit-reset"), v);
     }
     resp
 }

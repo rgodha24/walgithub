@@ -119,3 +119,12 @@ sweep_interval = "5m"
 2. Dedup on `(repo, _walgit.seq, ref_name)` (or on `X-Walgit-Delivery` per batch).
 3. Order by `_walgit.seq` within a repo; do not assume order across repos.
 4. On a gap alert from the bridge, backfill from `walgit wal ls <repo> --from <seq>`.
+
+## GitHub facade integrations
+
+The GitHub facade uses this bridge's WAL reader with independent per-installation/per-repo cursors at
+`github/events/<generation>.json`; it never shares this native sink's `events/cursor.json`. A failed
+GitHub target does not prevent another target (or the native webhook) from advancing. See
+`docs/GITHUB.md` §11 for registry subscription selection, retained-history replay and the separate
+best-effort PR handler deliveries. Catch-ups serialize per repo/target; sweeps process up to 16 repos
+concurrently. Run one events host; additional hosts may produce at-least-once duplicates.

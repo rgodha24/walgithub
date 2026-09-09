@@ -10,21 +10,41 @@ use serde_json::Value;
 type TestResult = anyhow::Result<()>;
 
 async fn server() -> anyhow::Result<Server> {
-    Server::start_with_tweak(|cfg| {
+    let s = Server::start_with_tweak(|cfg| {
         cfg.github.enabled = true;
         cfg.server.auto_create_on_push = true;
     })
-    .await
+    .await?;
+    client().put(format!("{}/api/v3/_dev/integrations/acme", s.base_url))
+        .json(&serde_json::json!({"app_id":1,"webhook_url":"http://127.0.0.1:9/webhook", "webhook_secret":"test-only",
+            "installations":[{"id":42,"owner":"acme","repository_selection":"all"}]}))
+        .send().await?.error_for_status()?;
+    Ok(s)
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::new()
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer e30.eyJpc3MiOjF9.dev".parse().unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }
 
 async fn get(s: &Server, path: &str) -> anyhow::Result<(reqwest::StatusCode, Value)> {
     let resp = client()
         .get(format!("{}{path}", s.base_url))
-        .header("Authorization", "Bearer anything-at-all")
+        .header(
+            "Authorization",
+            if path == "/api/v3/installation/repositories" {
+                "Bearer ghs_walgit_42"
+            } else {
+                "Bearer e30.eyJpc3MiOjF9.dev"
+            },
+        )
         .send()
         .await?;
     let status = resp.status();
@@ -49,13 +69,19 @@ fn fixture(s: &Server) -> anyhow::Result<(tempfile::TempDir, String)> {
     git_in(&dir, &["config", "user.name", "Dev"])?;
     std::fs::write(dir.join("README.md"), "# docs\n")?;
     git_in(&dir, &["add", "."])?;
-    git_in(&dir, &["commit", "-q", "-m", "initial commit\n\nwith a body"])?;
+    git_in(
+        &dir,
+        &["commit", "-q", "-m", "initial commit\n\nwith a body"],
+    )?;
     std::fs::create_dir_all(dir.join("pages"))?;
     std::fs::write(dir.join("pages/index.mdx"), "hello\n")?;
     git_in(&dir, &["add", "."])?;
     git_in(&dir, &["commit", "-q", "-m", "add a page"])?;
     git_in(&dir, &["tag", "-a", "v1", "-m", "release one"])?;
-    git_in(&dir, &["remote", "add", "origin", &s.repo_url("acme", "docs")])?;
+    git_in(
+        &dir,
+        &["remote", "add", "origin", &s.repo_url("acme", "docs")],
+    )?;
     git_in(&dir, &["push", "-q", "origin", "main", "--tags"])?;
     let head = git_in(&dir, &["rev-parse", "HEAD"])?.trim().to_string();
     Ok((tmp, head))
@@ -71,13 +97,15 @@ async fn auth_stubs_accept_anything_and_report_admin() -> TestResult {
 
     let app = ok(&s, "/api/v3/app").await?;
     assert!(
-        app["html_url"].as_str().is_some_and(|u| u.contains("/apps/")),
+        app["html_url"]
+            .as_str()
+            .is_some_and(|u| u.contains("/apps/")),
         "app.html_url: {app}"
     );
 
     let installs = ok(&s, "/api/v3/app/installations").await?;
     assert_eq!(installs[0]["repository_selection"], "all");
-    assert_eq!(installs[0]["account"]["login"], "mintlify-dev");
+    assert_eq!(installs[0]["account"]["login"], "acme");
 
     let one = ok(&s, "/api/v3/app/installations/42").await?;
     assert_eq!(one["id"], 42);
@@ -85,14 +113,21 @@ async fn auth_stubs_accept_anything_and_report_admin() -> TestResult {
     assert_eq!(one["permissions"]["contents"], "write");
 
     let resp = client()
-        .post(format!("{}/api/v3/app/installations/42/access_tokens", s.base_url))
+        .post(format!(
+            "{}/api/v3/app/installations/42/access_tokens",
+            s.base_url
+        ))
         .send()
         .await?;
     assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
     let token: Value = resp.json().await?;
-    assert_eq!(token["token"], "ghs_dev");
+    assert_eq!(token["token"], "ghs_walgit_42");
     assert_eq!(token["repository_selection"], "all");
-    assert!(token["expires_at"].as_str().is_some_and(|e| e.ends_with('Z')));
+    assert!(
+        token["expires_at"]
+            .as_str()
+            .is_some_and(|e| e.ends_with('Z'))
+    );
 
     let named = ok(&s, "/api/v3/users/someone").await?;
     assert_eq!(named["login"], "someone");
@@ -128,7 +163,10 @@ async fn oauth_web_flow_agrees_immediately() -> TestResult {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    assert!(loc.starts_with("http://app.test/cb?code=dev"), "location {loc}");
+    assert!(
+        loc.starts_with("http://app.test/cb?code=dev"),
+        "location {loc}"
+    );
     assert!(loc.contains("state=st%2Fate"), "location {loc}");
 
     let json: Value = client()
@@ -169,7 +207,9 @@ async fn reads_a_pushed_repository_in_github_shapes() -> TestResult {
     assert_eq!(repo["fork"], false);
     assert!(repo["id"].as_u64().is_some_and(|i| i > 0));
     assert!(
-        repo["clone_url"].as_str().is_some_and(|u| u.ends_with("/acme/docs.git")),
+        repo["clone_url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/acme/docs.git")),
         "clone_url {repo}"
     );
 
@@ -209,7 +249,10 @@ async fn reads_a_pushed_repository_in_github_shapes() -> TestResult {
     assert_eq!(list[0]["sha"], head);
 
     let paged = client()
-        .get(format!("{}/api/v3/repos/acme/docs/commits?per_page=1", s.base_url))
+        .get(format!(
+            "{}/api/v3/repos/acme/docs/commits?per_page=1",
+            s.base_url
+        ))
         .send()
         .await?;
     let link = paged
@@ -222,11 +265,7 @@ async fn reads_a_pushed_repository_in_github_shapes() -> TestResult {
     let page1: Value = paged.json().await?;
     assert_eq!(page1.as_array().map(Vec::len), Some(1));
 
-    let filtered = ok(
-        &s,
-        "/api/v3/repos/acme/docs/commits?path=pages/index.mdx",
-    )
-    .await?;
+    let filtered = ok(&s, "/api/v3/repos/acme/docs/commits?path=pages/index.mdx").await?;
     assert_eq!(filtered.as_array().map(Vec::len), Some(1));
 
     let branch = ok(&s, "/api/v3/repos/acme/docs/branches/main").await?;
@@ -436,11 +475,23 @@ async fn both_catch_all_dispatchers_keep_their_plain_shapes() -> TestResult {
     // The four sub-routes off a commit.
     let pulls = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/pulls")).await?;
     assert_eq!(pulls, Value::Array(Vec::new()), "{pulls}");
-    let runs = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/check-runs")).await?;
+    let runs = ok(
+        &s,
+        &format!("/api/v3/repos/acme/docs/commits/{head}/check-runs"),
+    )
+    .await?;
     assert_eq!(runs["total_count"], 0, "{runs}");
-    let status = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/status")).await?;
+    let status = ok(
+        &s,
+        &format!("/api/v3/repos/acme/docs/commits/{head}/status"),
+    )
+    .await?;
     assert_eq!(status["state"], "success", "{status}");
-    let statuses = ok(&s, &format!("/api/v3/repos/acme/docs/commits/{head}/statuses")).await?;
+    let statuses = ok(
+        &s,
+        &format!("/api/v3/repos/acme/docs/commits/{head}/statuses"),
+    )
+    .await?;
     assert_eq!(statuses, Value::Array(Vec::new()), "{statuses}");
 
     // `branches/{branch}` and the `/protection` its own catch-all dispatches.
@@ -470,8 +521,7 @@ async fn graphql_names_the_field_it_cannot_answer() -> TestResult {
             .json()
             .await?;
         assert_eq!(
-            body["errors"][0]["message"],
-            "not implemented: Whoami.viewer",
+            body["errors"][0]["message"], "not implemented: Whoami.viewer",
             "{path}"
         );
     }
