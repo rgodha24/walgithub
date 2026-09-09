@@ -1,0 +1,12 @@
+.git
+target
+**/node_modules
+web/dist
+.env*
+*.senv
+.senv
+.dev
+.review
+.pi
+result
+result-*
