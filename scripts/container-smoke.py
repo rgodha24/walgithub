@@ -133,6 +133,9 @@ def main():
             git("commit", "-qam", "Verify persisted integration")
             git("push", "-q", "origin", "feature")
             after = git("rev-parse", "HEAD")
+            git("clone", "-q", "--branch", "feature", BASE + "/" + REPO + ".git", "fetched")
+            assert git("-C", "fetched", "rev-parse", "HEAD") == after
+            assert (root / "fetched" / "index.mdx").read_text() == "# Updated after restart\n"
             wait_for("push", lambda p: p["after"] == after)
             wait_for("pull_request", lambda p: p["action"] == "synchronize" and p["after"] == after)
         assert not errors, errors
