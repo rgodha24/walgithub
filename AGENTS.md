@@ -30,6 +30,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `docs/LFS.md` | Anyone touching LFS (`lfs.rs`, `lfs_upstream.rs`) or importing a repository whose LFS history lives elsewhere. |
 | `docs/INTEGRITY.md` | Anyone touching import, the maintainer's `fsck`/`repair` units, or seeing `connectivity: missing object` on a push. |
 | `docs/EVENTS.md` | Anyone changing WAL-derived ref events, the webhook bridge, consumer semantics or event cursors. |
+| `docs/GITHUB.md` | Anyone touching `crates/walgit-server/src/github/*`, or pointing a GitHub-integrated app at walgit for local development. The facade's trust boundary (it has none), URL conventions, the write primitive, known limits. |
 | `docs/CONTRACT.md` | When you touch a crate boundary. The cross-crate contract; *extend, don't rename*; code wins where they differ. |
 | `docs/reference/cursor-git-at-any-scale.md` | The source design, verbatim. Read once before touching WAL/publish/sync/placement. |
 | `docs/patches/README.md` | Git client patches (bundle filter matching) and the gate for advertising filtered bundle families together. |
@@ -39,6 +40,7 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `walgit.example.toml` | Every config key with its default and a comment. Change it with the code. |
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
+| `docs/RELEASING.md` | Publishing the private editor E2E facade image and selecting its ECS digest. |
 | `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
 
 ---
@@ -400,9 +402,56 @@ decision in §4 — or the PR is; never "fix later".
   catch-up is exactly the slots missed; for a client fetching several times a day, upload-pack's thin pack is
   smaller than an hourly bundle — bundles pay off for fresh clones and far-behind clients.
 
+- **D42 (2026-09-02)** **A GitHub Enterprise Server facade, for local development only, behind
+  `[github] enabled`** (`docs/GITHUB.md`). `/api/v3/*` (REST), `/api/graphql` + `/api/v3/graphql` (both
+  shapes a client emits; parsed, dispatch is a later phase) and `/login/oauth/*` are answered over the same
+  repositories, so an application that already supports GitHub Enterprise Server needs no code to develop
+  against walgit: it points its per-install `baseUrl` at `http://<host>/api/v3`. Repositories are seeded by
+  a plain `git push` to the existing smart HTTP and by nothing else. **The facade is its own trust
+  boundary, and it has none**: every route bypasses `server.auth`, any credential resolves to one
+  hardcoded user, and every permission answer is `admin` — so `Config::validate` refuses `github.enabled`
+  unless `server.auth.mode = "none"` (already loopback-only) or `server.listen` is loopback, and the
+  facade is never deployed. Writes are not a second write path: `github::write` builds objects with `git`
+  plumbing in a scratch object directory over the serving copy's `objects/` (a refused write leaves nothing
+  behind, as with receive-pack's per-ingest scratch dir), packs exactly the new objects, and goes through
+  `ingest_pack` → `publish_push_synced`, so the bucket is the truth and the manifest CAS is still the only
+  commit point. The WAL does not enforce fast-forward, so the facade does it (`merge-base --is-ancestor`,
+  422 without `force`); a ref that moved under a write is a 409. No events are emitted from the write path
+  (principle III): `github::events` is a hook point, and a webhook must come from a WAL reader.
+  **(2026-09-03)** The three phases D42 planned have landed and two of its clauses have moved on.
+  GraphQL is no longer "parsed, dispatch is a later phase": `github/graphql/` dispatches on field names
+  against a hand-written arm per document, with no schema or executor, and an unserved field answers
+  `NOT_IMPLEMENTED` at HTTP 200. And the facade now owns durable state git cannot hold — pull requests,
+  as JSON under the repository's own prefix (`github/prs/index.json` + `github/prs/<n>.json`, CAS on
+  both) and one branch-protection object (`github/protection.json`). That state is the facade's alone:
+  it is not WAL, not replayed, and nothing outside `github/` reads it, so it does not widen the bucket
+  contract §2 defines. Everything else in D42 stands — the trust boundary, the `validate` refusal, and
+  writes going through `ingest_pack` → `publish_push_synced` and no second path, merges included.
+  **(2026-09-03)** The facade now emits **outbound GitHub webhooks** (`docs/GITHUB.md` §11), and the "no
+  events from the write path" clause is honoured rather than dropped: `push` / `create` / `delete` (and
+  `pull_request.synchronize`) are rendered by a second sink on the **events bridge** (`crate::bridge`,
+  `github/webhook.rs`) from log entries read at a durable cursor, so a delivery happens iff the entry is
+  durable, a non-2xx keeps the cursor, and a dead consumer costs receive-pack nothing. `[github]` gains
+  `webhook_url`, `webhook_secret`, `installation_id` (default 1) and `webhook_poll_interval` (default 1 s);
+  the bridge runs on the default empty `roles`, so a standalone facade needs no roles setting. Two
+  concessions, both scoped to this sink: a write on the same instance calls `Bridge::wake` so the typical
+  push-to-delivery latency is ~20 ms rather than a poll interval (the walgit-native bus keeps exactly
+  `docs/EVENTS.md`'s two wake-ups), and a dev bucket's missing notifications make a productive sweep a debug
+  line instead of a warning. The one thing not from the WAL is `pull_request` itself — PR state is the
+  facade's own JSON, not log entries — so those deliveries are spawned from the handlers, best effort with a
+  couple of retries, and never awaited by a request.
+
 Decision identifiers are stable; gaps in the numbering are intentional.
 
 ---
+
+**D43 — AWS runtime credentials (2026-09-08).** The S3 backend uses the AWS SDK credential chain when
+neither configured static-key variable is set. This supports refreshing ECS task roles without storing
+long-lived access keys. Explicit pairs still support local object stores; partial pairs fail closed.
+
+**D44 — Facade release images (2026-09-09).** The private walgithub repository builds images on published
+GitHub releases. Release tags select commits already on main; AWS OIDC grants access only to the dev ECR
+repository. Infrastructure selects the resulting digest separately. See `docs/RELEASING.md`.
 
 ## 5. Working rules
 

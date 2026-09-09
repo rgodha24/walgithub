@@ -10,6 +10,7 @@ pub mod error;
 pub mod events;
 pub mod follow;
 pub mod forward;
+pub mod github;
 pub mod health;
 pub mod instance;
 pub mod lfs;
@@ -92,7 +93,7 @@ impl AppState {
         if let Some(t) = &tls {
             tracing::info!(fingerprint = %t.fingerprint, mode = ?cfg.server.tls.mode, "TLS terminated in-process");
         }
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             cfg: cfg.clone(),
             store,
             registry,
@@ -107,7 +108,13 @@ impl AppState {
             bridge,
             follow: follow::FollowStatuses::default(),
             tls,
-        }))
+        });
+        // The GitHub sink renders its payloads out of the repository, so it
+        // needs this instance — which did not exist when the bridge was built.
+        if let Some(b) = &state.bridge {
+            b.attach_state(&state);
+        }
+        Ok(state)
     }
 }
 
@@ -143,6 +150,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             state.clone(),
             web::require_auth,
         ));
+    // The GitHub Enterprise Server facade (`docs/GITHUB.md`, D42). Merged
+    // before the fallback so `/api/v3/*` never reaches `dispatch`, which would
+    // read it as `owner = api`, `repo = v3`. Its own trust boundary: none of
+    // these routes consult `server.auth`, which is why `Config::validate`
+    // refuses `github.enabled` off a loopback bind.
+    let facade = state
+        .cfg
+        .github
+        .enabled
+        .then(|| github::router(state.clone()).with_state(()));
     let inner = Router::new()
         .merge(
             web::api::router(state.clone())
@@ -155,6 +172,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(web_compression),
         )
         .merge(gated)
+        .merge(facade.unwrap_or_default())
         .route("/healthz", get(health::healthz))
         .route("/readyz", get(health::readyz))
         // The SDK is a static artefact with no data in it; it must load from a

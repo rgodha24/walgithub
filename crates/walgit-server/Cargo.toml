@@ -65,6 +65,7 @@ rustls-pemfile.workspace = true
 rcgen.workspace = true
 tokio-rustls.workspace = true
 tempfile.workspace = true
+graphql-parser.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 rcgen = { workspace = true, features = ["x509-parser"] }

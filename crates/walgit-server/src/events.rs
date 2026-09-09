@@ -164,6 +164,11 @@ pub(crate) fn refs_from_entries(repo: &RepoId, entries: &[LogEntry], out: &mut V
 #[async_trait::async_trait]
 pub(crate) trait Sink: Send + Sync {
     fn name(&self) -> &'static str;
+    /// The instance this sink belongs to, handed over once the `AppState` Arc
+    /// exists (it does not when `Bridge::new` runs). Only the GitHub sink
+    /// needs it — it renders its payloads out of the repository — and it keeps
+    /// a `Weak`, so a sink never keeps the state alive.
+    fn attach_state(&self, _st: &std::sync::Arc<crate::AppState>) {}
     async fn deliver(&self, batch: &[RefEvent]) -> anyhow::Result<()>;
 }
 

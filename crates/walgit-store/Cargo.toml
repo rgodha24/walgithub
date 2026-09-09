@@ -37,6 +37,7 @@ aws-sdk-s3 = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 [dev-dependencies]
+serde_json.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 sha1 = { workspace = true }

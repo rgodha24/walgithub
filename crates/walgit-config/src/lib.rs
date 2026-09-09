@@ -27,6 +27,7 @@ pub struct Config {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     pub events: EventsConfig,
+    pub github: GithubConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -768,6 +769,51 @@ impl Default for EventsConfig {
     }
 }
 
+/// `docs/GITHUB.md` — the GitHub Enterprise Server facade: `/api/v3/*`,
+/// `/api/graphql` and `/login/oauth/*` answered from the WAL so an octokit
+/// pointed at this host reads and writes real repositories in the bucket.
+///
+/// **Local development only.** The facade is auth-free by construction: it
+/// accepts any bearer, reports one hardcoded user with admin on everything and
+/// never consults `server.auth`. `Config::validate` therefore requires
+/// `server.auth.mode = "none"` and, with the facade on, lets that mode bind
+/// beyond loopback: the network the process sits on is the trust boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GithubConfig {
+    /// Mount the facade. Off everywhere but a developer's machine.
+    pub enabled: bool,
+    /// Where GitHub-shaped webhooks go (`docs/GITHUB.md` §Webhooks). Set it and
+    /// the events bridge renders every WAL ref event as a `push` / `create` /
+    /// `delete` delivery besides the walgit-native `events.webhook_url` batch,
+    /// and the PR handlers send `pull_request` deliveries. Unset = no webhooks.
+    pub webhook_url: Option<String>,
+    /// Shared secret for `x-hub-signature-256: sha256=<HMAC-SHA256 of the raw
+    /// body>`. Unset = unsigned, which every GitHub client rejects.
+    pub webhook_secret: Option<String>,
+    /// `installation.id` in every payload. A GitHub App consumer keys its
+    /// install on this.
+    pub installation_id: u64,
+    /// How often the bridge polls for ref changes while the github sink is on.
+    /// A push on this instance wakes the bridge directly, so this only covers
+    /// writes by another process (and stores with no notifications, which is
+    /// every dev bucket). `0` = only `events.sweep_interval`.
+    #[serde(with = "humantime_serde")]
+    pub webhook_poll_interval: Duration,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        GithubConfig {
+            enabled: false,
+            webhook_url: None,
+            webhook_secret: None,
+            installation_id: 1,
+            webhook_poll_interval: Duration::from_secs(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
@@ -1025,6 +1071,7 @@ impl Default for Config {
             git: GitConfig::default(),
             telemetry: TelemetryConfig::default(),
             events: EventsConfig::default(),
+            github: GithubConfig::default(),
         }
     }
 }
@@ -1466,9 +1513,23 @@ impl Config {
                 "server.cors_origins entries must be https origins (or http://localhost[:port]) with at most one leading `*.` wildcard, got {o:?}"
             );
         }
+        // The GitHub facade is its own trust boundary and has none: it accepts
+        // any credential and is admin on every repository. Mounting it on a
+        // host that is not already open to its network is a way to hand the
+        // bucket away, so it fails closed the way `auth.mode = none` does.
+        // With the facade on, the network the process is bound to *is* the
+        // trust boundary (a developer's compose network), so `auth.mode = none`
+        // is the only honest mode and the loopback rule below yields to it.
+        if self.github.enabled {
+            anyhow::ensure!(
+                self.server.auth.mode == AuthMode::None,
+                "github.enabled is auth-free (any bearer is accepted, every repository is admin): it needs server.auth.mode = \"none\" (auth.mode is {:?})",
+                self.server.auth.mode
+            );
+        }
         // Security contract: identity modes fail closed.
         let a = &self.server.auth;
-        if a.mode == AuthMode::None {
+        if a.mode == AuthMode::None && !self.github.enabled {
             anyhow::ensure!(
                 self.server.listen.ip().is_loopback(),
                 "server.auth.mode = none is loopback-only (listen is {}); use token or oidc for a public bind",
@@ -1574,6 +1635,12 @@ impl Config {
             anyhow::ensure!(
                 u.starts_with("http://") || u.starts_with("https://"),
                 "events.webhook_url must be an http(s) URL"
+            );
+        }
+        if let Some(u) = &self.github.webhook_url {
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "github.webhook_url must be an http(s) URL"
             );
         }
         Ok(())
@@ -1971,6 +2038,31 @@ webhook_secret = "s"
         assert_eq!(c.events.webhook_secret.as_deref(), Some("s"));
         let err = Config::parse("[events]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
         assert!(err.to_string().contains("webhook_url"), "{err}");
+    }
+
+    #[test]
+    fn github_webhook_section_parses_and_validates() {
+        let d = GithubConfig::default();
+        assert_eq!(d.installation_id, 1);
+        assert_eq!(d.webhook_poll_interval, Duration::from_secs(1));
+        assert!(d.webhook_url.is_none() && d.webhook_secret.is_none());
+        let c = Config::parse(
+            r#"
+[server.auth]
+mode = "none"
+[github]
+enabled = true
+webhook_url = "http://127.0.0.1:3000/github-enterprise/acme"
+webhook_secret = "s"
+installation_id = 55555555
+webhook_poll_interval = "250ms"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.github.installation_id, 55_555_555);
+        assert_eq!(c.github.webhook_poll_interval, Duration::from_millis(250));
+        let err = Config::parse("[github]\nwebhook_url = \"ftp://x\"\n").unwrap_err();
+        assert!(err.to_string().contains("github.webhook_url"), "{err}");
     }
 
     #[test]

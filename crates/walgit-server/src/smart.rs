@@ -1288,6 +1288,11 @@ async fn receive_pack_process(
     }
     let per_ref = per_ref_policy;
     tracing::info!(seq, refs = per_ref.len(), "receive-pack published");
+    // The events bridge is a WAL reader, not a step of this write; waking it
+    // here only saves it a poll interval (docs/EVENTS.md, docs/GITHUB.md).
+    if let Some(bridge) = &st.bridge {
+        bridge.wake(handle.id());
+    }
 
     let report = build_report(&caps, unpack_result, &per_ref).await;
     Ok(report)
