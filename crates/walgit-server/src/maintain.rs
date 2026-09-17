@@ -39,7 +39,6 @@ pub async fn run_loop(state: Arc<AppState>) {
     let mut passes = 0u64;
     let mut last_unit = String::new();
     loop {
-        tokio::time::sleep(interval).await;
         if walgit_wal::tasks::draining() {
             info!("maintenance loop: draining, no new pass");
             return;
@@ -97,6 +96,7 @@ pub async fn run_loop(state: Arc<AppState>) {
         if let Err(e) = heartbeat(&state, &host, started, passes, &last_unit).await {
             warn!(error = %e, "maintenance heartbeat failed");
         }
+        tokio::time::sleep(interval).await;
     }
 }
 
