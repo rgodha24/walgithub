@@ -1267,7 +1267,24 @@ impl RepoHandle {
         from_seq: u64,
         to_seq: Option<u64>,
     ) -> Result<Vec<walgit_proto::v1::LogEntry>, WalError> {
-        crate::log_reader::read_log_impl(self, from_seq, to_seq).await
+        crate::log_reader::read_log_impl(self, from_seq, to_seq, false).await
+    }
+
+    /// Read committed log entries, following checkpoint history when the
+    /// requested range has left the manifest. Missing history is an error,
+    /// never a successful partial read. No object-store LIST or orphan probes.
+    pub async fn read_log_retained(
+        &self,
+        from_seq: u64,
+        to_seq: Option<u64>,
+    ) -> Result<Vec<walgit_proto::v1::LogEntry>, WalError> {
+        crate::log_reader::read_log_impl(self, from_seq, to_seq, true).await
+    }
+
+    /// Initial cursor before the oldest indexed retained entry. Revalidate
+    /// refs first; missing checkpoint objects are errors, not skipped history.
+    pub async fn retained_log_start(&self) -> Result<u64, WalError> {
+        crate::log_reader::retained_log_start(self).await
     }
 
     // ---- internal helpers ----

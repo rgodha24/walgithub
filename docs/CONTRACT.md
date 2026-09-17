@@ -213,6 +213,10 @@ impl RepoHandle {
   pub async fn write_checkpoint(&self) -> Result<CheckpointRef, WalError>;
   /// Read log entries [from_seq, to_seq] from the store (provenance/rewind tooling).
   pub async fn read_log(&self, from_seq: u64, to_seq: Option<u64>) -> Result<Vec<LogEntry>, WalError>;
+  /// Includes committed checkpoint history; unavailable history is an error, never a partial result.
+  pub async fn read_log_retained(&self, from_seq: u64, to_seq: Option<u64>) -> Result<Vec<LogEntry>, WalError>;
+  /// Initial durable cursor before the oldest indexed history; call after refs sync.
+  pub async fn retained_log_start(&self) -> Result<u64, WalError>;
   pub fn last_access(&self) -> Instant;  pub fn touch(&self);
 }
 pub enum WalError { NotFound, AlreadyExists, RefConflict{name, expected, actual}, Store(StoreError),

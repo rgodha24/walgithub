@@ -556,7 +556,9 @@ New installations and changed repository selections get a new persisted generati
 replays the oldest retained WAL entries, including existing repos in a changed selection. Deleting and
 recreating an installation cannot inherit its old cursor. Unchanged selections and secret/callback-only
 updates preserve cursors. Register before seeding to avoid unexpected historical backfill; callbacks
-must tolerate duplicates. WAL retention gaps remain explicit warnings/metrics as in `docs/EVENTS.md`.
+must tolerate duplicates. The first cursor boundary is saved before delivery; checkpoints retain their
+committed segment index so a lagging target can replay it after a restart. Missing indexed history fails
+without advancing the cursor (`docs/EVENTS.md`). Each batch synchronizes one object view per repo.
 One events host remains the supported deployment: running overlapping hosts can produce duplicates.
 
 Two wake-ups reach it here:

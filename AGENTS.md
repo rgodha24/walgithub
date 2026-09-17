@@ -466,6 +466,12 @@ failure never advances another target's cursor. App JWT issuer and synthetic ins
 registered identity/listing, without introducing authentication. PR events remain best effort.
 `docs/GITHUB.md` §11 and `docs/ROUNDTRIPS.md` own the contract and cost model.
 
+**D47 — Durable checkpoint history (2026-09-17).** Each checkpoint records the log segments it folds
+and its preceding checkpoint. The bridge traverses that immutable index when its cursor falls behind
+`min_seq`, and fails without acknowledging if indexed history is unavailable. Keep those checkpoint/log
+objects; unreferenced log objects are not evidence of a committed write. This adds no publish/checkpoint
+round trips and no object-store LIST.
+
 ## 5. Working rules
 
 - **No backwards compatibility (pre-1.0, banner at top):** change the shape and delete the old one in the same

@@ -191,6 +191,11 @@ message Checkpoint {
   string bundle_key = 6;
   google.protobuf.Timestamp created_at = 7;
   string writer = 8;
+  // Committed log segments folded by this checkpoint. Keep their immutable
+  // objects: lagging WAL readers use this index after the manifest trims them.
+  repeated LogSegmentRef log_segments = 9;
+  // Previous committed checkpoint; the chain indexes history without LIST.
+  CheckpointRef previous = 10;
 }
 
 message CheckpointRef {

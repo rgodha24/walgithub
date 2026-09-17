@@ -47,10 +47,6 @@ pub struct CatchUp {
     pub from_seq: u64,
     pub head_seq: u64,
     pub emitted: usize,
-    /// `[first, last]` seqs folded into a checkpoint before the bridge read
-    /// them: not emitted, counted — consumers backfill from the WAL.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gap: Option<[u64; 2]>,
 }
 
 pub struct Bridge {
@@ -154,7 +150,6 @@ impl Bridge {
                 current.from_seq = current.from_seq.min(next.from_seq);
                 current.head_seq = current.head_seq.max(next.head_seq);
                 current.emitted += next.emitted;
-                current.gap = current.gap.or(next.gap);
             } else {
                 report = Some(next);
             }
@@ -219,41 +214,38 @@ impl Bridge {
             m
         };
         let head = manifest.head_seq;
-        // Entries below `min_seq` are folded into a checkpoint and no longer
-        // in the manifest's log window; `min_seq - 1` is the newest seq we
-        // can treat as "already published" when starting cold.
-        let readable_from = manifest.min_seq.saturating_sub(1);
         let store = handle.store();
 
-        let (cursor, version) = match store.get_bytes(cursor_key).await? {
-            Some((meta, bytes)) => {
-                let c: Cursor = serde_json::from_slice(&bytes).context("events/cursor.json")?;
-                (Some(c.published_seq), Some(meta.version))
+        // Persist the starting boundary before doing any delivery. Otherwise a
+        // failed first attempt followed by a checkpoint would start at a newer
+        // min_seq on retry and silently abandon that first batch.
+        let (from, version) = loop {
+            if let Some((meta, bytes)) = store.get_bytes(cursor_key).await? {
+                let c: Cursor = serde_json::from_slice(&bytes).context("event cursor")?;
+                break (c.published_seq, meta.version);
             }
-            None => (None, None),
+            let start = handle.retained_log_start().await?;
+            let body = serde_json::to_vec(&Cursor {
+                published_seq: start,
+                updated_at: Utc::now().to_rfc3339(),
+            })?;
+            match store.put_bytes(cursor_key, body, PutMode::Create).await {
+                Ok(meta) => break (start, meta.version),
+                Err(StoreError::PreconditionFailed { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
         };
-        let mut from = cursor.unwrap_or(readable_from);
-        let mut gap = None;
-        if from < readable_from {
-            gap = Some([from + 1, readable_from]);
-            metrics::counter!("events_bridge_gap_total", "repo" => id.to_string())
-                .increment(readable_from - from);
-            tracing::warn!(repo = %id, first = from + 1, last = readable_from,
-                "events bridge: entries folded into a checkpoint before they were published; consumers backfill from the WAL");
-            from = readable_from;
-        }
         metrics::gauge!("events_bridge_lag_entries", "repo" => id.to_string())
-            .set((head - from) as f64);
+            .set(head.saturating_sub(from) as f64);
         let mut report = CatchUp {
             repo: id.to_string(),
             from_seq: from,
             head_seq: head,
             emitted: 0,
-            gap,
         };
 
         if head > from {
-            let entries = handle.read_log(from + 1, Some(head)).await?;
+            let entries = handle.read_log_retained(from + 1, Some(head)).await?;
             let mut batch = Vec::new();
             events::refs_from_entries(id, &entries, &mut batch);
             // A failing sink returns here: cursor untouched, retried on the
@@ -268,15 +260,12 @@ impl Bridge {
             report.emitted = batch.len();
         }
 
-        if cursor != Some(head) {
+        if from < head {
             let body = serde_json::to_vec(&Cursor {
                 published_seq: head,
                 updated_at: Utc::now().to_rfc3339(),
             })?;
-            let mode = match version {
-                Some(v) => PutMode::Update(v),
-                None => PutMode::Create,
-            };
+            let mode = PutMode::Update(version);
             match store.put_bytes(cursor_key, body, mode).await {
                 Ok(_) => {}
                 // Another bridge instance advanced it: our emission was a

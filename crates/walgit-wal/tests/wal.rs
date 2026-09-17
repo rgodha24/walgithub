@@ -877,6 +877,14 @@ async fn test_orphan_log_invisible_and_cleaned() {
         !log.iter().any(|e| e.seq == 99),
         "Orphan entry should not be in log"
     );
+    drop(_g);
+    handle2.write_checkpoint().await.unwrap();
+    let retained = handle2.read_log_retained(1, Some(99)).await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].seq, 1,
+        "archived replay must use the committed index"
+    );
 }
 
 #[tokio::test]
@@ -2624,4 +2632,55 @@ async fn a_landed_cas_is_ok_even_when_the_local_apply_fails_and_the_next_sync_re
         c1
     );
     assert_eq!(handle.applied_seq(), 2);
+}
+
+/// Existing buckets may contain checkpoints without a history index. A new
+/// cursor starts at that boundary; an existing cursor behind it must error.
+#[tokio::test]
+async fn retained_log_starts_at_unindexed_checkpoint_boundary() {
+    use prost::Message;
+    use walgit_store::{ObjectStoreExt, PutMode};
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let registry = Registry::new(store, Arc::new(make_config(cache.path(), 0)));
+    let handle = registry
+        .create(&repo_id("test", "history"), ObjectFormat::Sha1)
+        .await
+        .unwrap();
+    let work = WorkRepo::new();
+    let sha = work.commit("seed", "body");
+    let pack = ingest_pack_data(&handle, work.create_pack()).await.unwrap();
+    handle
+        .publish_push(
+            Some(pack),
+            make_txn(vec![("refs/heads/main", "", &sha)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let cp = handle.write_checkpoint().await.unwrap();
+    let (_, bytes) = handle.store().get_bytes(&cp.key).await.unwrap().unwrap();
+    let mut archived = walgit_proto::v1::Checkpoint::decode(bytes.as_ref()).unwrap();
+    archived.log_segments.clear();
+    archived.previous = None;
+    handle
+        .store()
+        .put_bytes(&cp.key, archived.encode_to_vec(), PutMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(handle.retained_log_start().await.unwrap(), 1);
+    assert!(handle.read_log_retained(1, None).await.is_err());
+    handle
+        .publish_ref_update(
+            make_txn(vec![("refs/heads/next", "", &sha)]),
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+    handle.write_checkpoint().await.unwrap();
+    assert_eq!(handle.retained_log_start().await.unwrap(), 1);
+    let log = handle.read_log_retained(2, None).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].seq, 2);
+    assert!(handle.read_log_retained(1, None).await.is_err());
 }

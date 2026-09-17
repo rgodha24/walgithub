@@ -568,8 +568,25 @@ async fn slow_failed_integration_cannot_block_other_repos_or_advance_its_cursor(
     })
     .await;
     assert!(latency < Duration::from_secs(2));
-    control.permits.add_permits(100);
+    // The failing target is still blocked on its first delivery. Checkpoint
+    // two later pushes in the SAME repo; each integration must replay its own
+    // cursor through both checkpoints without losing the intermediate push.
     let id = "acme/docs".parse()?;
+    let handle = s.state.registry.open(&id).await?;
+    let mut expected_heads = Vec::new();
+    for branch in ["external/first", "external/second"] {
+        commit_in(&dir, "page.mdx", branch, branch)?;
+        let sha = git_in(&dir, &["rev-parse", "HEAD"])?;
+        git_in(
+            &dir,
+            &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+        )?;
+        handle.write_checkpoint().await?;
+        wait_for(&healthy, "push", |p| p["after"] == sha.trim()).await;
+        expected_heads.push(sha.trim().to_string());
+    }
+    assert!(handle.manifest().log_segments.is_empty());
+    control.permits.add_permits(100);
     assert!(
         s.state
             .bridge
@@ -592,6 +609,23 @@ async fn slow_failed_integration_cannot_block_other_repos_or_advance_its_cursor(
         failed.lock().unwrap().len() > failed_before,
         "failed cursor skipped its events"
     );
+    {
+        let delivered = failed.lock().unwrap();
+        let heads: Vec<_> = delivered
+            .iter()
+            .filter(|d| d.event == "push")
+            .filter_map(|d| d.payload["after"].as_str())
+            .collect();
+        assert!(
+            heads.ends_with(
+                &expected_heads
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            ),
+            "checkpointed pushes missing or out of order: {heads:?}"
+        );
+    }
     let failed_before = failed.lock().unwrap().len();
     s.state.bridge.as_ref().unwrap().catch_up(&id).await?;
     assert_eq!(

@@ -18,9 +18,9 @@ Invariants:
    milliseconds to receive-pack; it adds lag, which is a metric.
 2. No no-op events. `old == new` (and `0→0`) emits nothing.
 3. No lost events: the cursor advances only after the webhook answered 2xx. Duplicates are possible
-   (at-least-once) and carry a deterministic dedup key. What *can* happen is a **gap when the bridge lags behind
-   log retention** (entries folded into a checkpoint before they were read): counted (`events_bridge_gap_total`)
-   and warned, never silently repaired — consumers backfill from the WAL.
+   (at-least-once) and carry a deterministic dedup key. Checkpoints preserve their committed segment index
+   and a pointer to the preceding checkpoint, so lagging consumers can replay after the manifest trims
+   its log window. Missing history fails the catch-up without advancing the cursor.
 4. One producer, one instance.
 
 Only `ref` events exist. Not events: push denials and auth failures (metrics + logs), LFS, compaction/checkpoints
@@ -70,9 +70,10 @@ Answer 2xx to acknowledge; anything else (or a timeout, 10 s) leaves the cursor 
 retries the same range on the next wake-up. A consumer therefore sees at-least-once delivery of whole batches.
 Verify the signature with a constant-time compare before parsing.
 
-**Backfill contract (normative for consumers):** on any gap, read the WAL log from your last known seq
-(`walgit wal ls`) and treat each PUSH / REF_UPDATE entry's ref transaction as the missed events. The webhook is
-a latency optimization over polling the log; correctness never depends on it.
+**Retention:** keep checkpoint objects and their indexed log segments. Checkpointing folds serving state;
+it does not acknowledge webhook deliveries. History written before checkpoints carried segment indexes
+cannot be recovered by this reader; it returns an error rather than skipping it. Already advanced cursors
+are not rewound automatically.
 
 ## The bridge
 
@@ -87,10 +88,11 @@ writers (any host, broker, CLI, import) ── manifest.pb CAS ──► bucket 
 
 `catch_up(repo)` = read `repos/<o>/<r>/events/cursor.json` → fresh manifest → log entries `(cursor, head_seq]` →
 `ref` events → webhook → CAS the cursor to `head_seq`. A webhook error leaves the cursor; the next wake-up replays
-the same range. A cold cursor starts at the oldest readable seq (`min_seq − 1`: everything still in the manifest's
-log window is published once; pre-seed the cursor to skip history). Every published event is also one structured
-log line (`event_type="ref"`). Metrics: `events_published_total{sink}`, `events_bridge_lag_entries{repo}`,
-`events_bridge_gap_total{repo}`, `events_bridge_sweep_found_total`; alert on lag growth, any gap, any sweep-found.
+the same range. A cold cursor starts before the oldest indexed retained entry (including checkpoint history;
+pre-seed the cursor to skip history). An import or pre-index checkpoint is the initial history boundary. That initial boundary is persisted before
+any delivery, so a failed first attempt retries the same history after a checkpoint or restart. Every published
+event is also one structured log line (`event_type="ref"`). Metrics: `events_published_total{sink}`,
+`events_bridge_lag_entries{repo}`, `events_bridge_sweep_found_total`; alert on lag growth and catch-up errors.
 
 Wake-ups (both idempotent; they only ever call `catch_up`):
 - `POST /_events/notify` with a **bucket notification** naming a finalized `…/manifest.pb` — the commit point
@@ -118,7 +120,7 @@ sweep_interval = "5m"
 1. Verify `X-Walgit-Signature` (if you set a secret), then parse the array.
 2. Dedup on `(repo, _walgit.seq, ref_name)` (or on `X-Walgit-Delivery` per batch).
 3. Order by `_walgit.seq` within a repo; do not assume order across repos.
-4. On a gap alert from the bridge, backfill from `walgit wal ls <repo> --from <seq>`.
+4. Alert on catch-up errors and growing lag; missing stored history requires operator recovery.
 
 ## GitHub facade integrations
 

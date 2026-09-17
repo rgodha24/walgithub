@@ -1,7 +1,8 @@
 //! Read log entries from the store (provenance/rewind tooling).
 
-use walgit_proto::v1::LogEntry;
-use walgit_store::{GetOptions, GetResult, ObjectStore};
+use prost::Message;
+use walgit_proto::v1::{Checkpoint, LogEntry};
+use walgit_store::{GetOptions, GetResult, ObjectStore, ObjectStoreExt};
 
 use crate::error::WalError;
 use crate::handle::RepoHandle;
@@ -12,6 +13,7 @@ pub(crate) async fn read_log_impl(
     handle: &RepoHandle,
     from_seq: u64,
     to_seq: Option<u64>,
+    retained: bool,
 ) -> Result<Vec<LogEntry>, WalError> {
     // Reading the log needs a *fresh manifest*, not a synced local copy: do a
     // lock-free conditional GET and use whichever manifest is newer. Taking
@@ -29,12 +31,36 @@ pub(crate) async fn read_log_impl(
         return Ok(Vec::new());
     }
 
-    // Find relevant segments
-    let segments: Vec<&walgit_proto::v1::LogSegmentRef> = manifest
-        .log_segments
-        .iter()
-        .filter(|s| s.last_seq >= from_seq && s.first_seq <= to)
-        .collect();
+    let mut segments = manifest.log_segments.clone();
+    if retained && from_seq < manifest.min_seq {
+        let mut checkpoint = manifest.checkpoint.clone();
+        let mut covered_from = manifest.min_seq;
+        while from_seq < covered_from {
+            let cp = checkpoint.ok_or_else(|| {
+                WalError::Corrupt(format!(
+                    "log history before seq {covered_from} is unavailable"
+                ))
+            })?;
+            if cp.seq >= covered_from {
+                return Err(WalError::Corrupt(
+                    "checkpoint history is not decreasing".into(),
+                ));
+            }
+            let archived = read_checkpoint(handle, &cp).await?;
+            if archived.log_segments.is_empty() {
+                return Err(WalError::Corrupt(format!(
+                    "log history at checkpoint {} is unavailable",
+                    cp.seq
+                )));
+            }
+            covered_from = archived.previous.as_ref().map_or(1, |p| p.seq + 1);
+            segments.extend(archived.log_segments);
+            checkpoint = archived.previous;
+        }
+    }
+    segments.retain(|s| s.last_seq >= from_seq && s.first_seq <= to);
+    segments.sort_by_key(|s| s.first_seq);
+    segments.dedup_by(|a, b| a.key == b.key);
 
     let mut entries = Vec::new();
     for seg in &segments {
@@ -49,6 +75,15 @@ pub(crate) async fn read_log_impl(
         let (seg_entries, _) = walgit_proto::frame::decode_entries(&bytes)
             .map_err(|e| WalError::Corrupt(format!("log segment decode: {e}")))?;
 
+        if retained
+            && (seg_entries.first().map(|e| e.seq) != Some(seg.first_seq)
+                || seg_entries.last().is_none_or(|e| e.seq < seg.last_seq))
+        {
+            return Err(WalError::Corrupt(format!(
+                "incomplete log segment {}",
+                seg.key
+            )));
+        }
         for entry in seg_entries {
             if entry.seq >= from_seq && entry.seq <= to {
                 entries.push(entry);
@@ -58,6 +93,43 @@ pub(crate) async fn read_log_impl(
 
     entries.sort_by_key(|e| e.seq);
     Ok(entries)
+}
+
+/// The initial cursor for a new durable reader. Include indexed archived
+/// history even when its first pass happens after a checkpoint. An import or
+/// an older checkpoint without an index is the boundary of available history.
+pub(crate) async fn retained_log_start(handle: &RepoHandle) -> Result<u64, WalError> {
+    let manifest = handle.manifest();
+    let mut checkpoint = manifest.checkpoint.clone();
+    let mut start = manifest.min_seq.saturating_sub(1);
+    while let Some(cp) = checkpoint {
+        let archived = read_checkpoint(handle, &cp).await?;
+        if archived.log_segments.is_empty() {
+            return Ok(cp.seq);
+        }
+        start = archived.previous.as_ref().map_or(0, |p| p.seq);
+        checkpoint = archived.previous;
+    }
+    Ok(start)
+}
+
+async fn read_checkpoint(
+    handle: &RepoHandle,
+    cp: &walgit_proto::v1::CheckpointRef,
+) -> Result<Checkpoint, WalError> {
+    let (_, bytes) =
+        handle.store.get_bytes(&cp.key).await?.ok_or_else(|| {
+            WalError::Corrupt(format!("checkpoint history {} is missing", cp.key))
+        })?;
+    let archived = Checkpoint::decode(bytes.as_ref())
+        .map_err(|e| WalError::Corrupt(format!("checkpoint decode: {e}")))?;
+    if archived.seq != cp.seq || archived.previous.as_ref().is_some_and(|p| p.seq >= cp.seq) {
+        return Err(WalError::Corrupt(format!(
+            "invalid checkpoint history at seq {}",
+            cp.seq
+        )));
+    }
+    Ok(archived)
 }
 
 /// Ref state **as of** `at`: the newest checkpoint snapshot whose seq is at

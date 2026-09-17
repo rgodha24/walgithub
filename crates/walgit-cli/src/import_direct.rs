@@ -805,6 +805,8 @@ pub async fn run_with_store(
         bundle_key,
         created_at: Some(time::now()),
         writer: format!("walgit-import@{}", hostname()),
+        log_segments: Vec::new(),
+        previous: None,
     };
     let cp_key = keys::checkpoint_key(seq);
     repo_store

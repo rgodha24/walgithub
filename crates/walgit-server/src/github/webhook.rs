@@ -275,25 +275,13 @@ impl GithubSink {
             .ok_or_else(|| anyhow::anyhow!("github webhook sink has no server state attached"))
     }
 
-    async fn deliver_ref(&self, st: &Arc<AppState>, ev: &RefEvent) -> anyhow::Result<()> {
-        if ev.ref_type.is_empty() {
-            return Ok(());
-        }
-        let (owner, name) = ev
-            .repo
-            .split_once('/')
-            .ok_or_else(|| anyhow::anyhow!("bad repo id {}", ev.repo))?;
-        let id = RepoId::new(owner, name)?;
-        let urls = urls(&st.cfg);
-        let view = repo::objects_view(st, &id)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let repository = super::prs::repo_json(&view, &urls);
+    async fn deliver_ref(&self, view: &View, urls: &Urls, ev: &RefEvent) -> anyhow::Result<()> {
+        let repository = super::prs::repo_json(view, urls);
 
         let created = all_zeros(&ev.old);
         let deleted = all_zeros(&ev.new);
         if ev.ref_type == "branch" {
-            let push = self.push_payload(&view, &urls, &repository, ev).await?;
+            let push = self.push_payload(view, urls, &repository, ev).await?;
             self.sender.deliver("push", &push).await?;
         }
         if created || deleted {
@@ -301,17 +289,17 @@ impl GithubSink {
             let payload = json!({
                 "ref": short_ref(&ev.ref_name),
                 "ref_type": ev.ref_type,
-                "master_branch": default_branch(&view),
+                "master_branch": default_branch(view),
                 "description": Value::Null,
                 "pusher_type": "user",
                 "repository": repository,
                 "installation": json!({ "id": self.installation_id }),
-                "sender": sender_user(&urls),
+                "sender": sender_user(urls),
             });
             self.sender.deliver(event, &payload).await?;
         }
         if ev.ref_type == "branch" && !created && !deleted {
-            self.synchronize_prs(&view, &urls, &repository, ev).await?;
+            self.synchronize_prs(view, urls, &repository, ev).await?;
         }
         Ok(())
     }
@@ -444,8 +432,27 @@ impl Sink for GithubSink {
 
     async fn deliver(&self, batch: &[RefEvent]) -> anyhow::Result<()> {
         let st = self.state()?;
-        for ev in batch {
-            self.deliver_ref(&st, ev).await?;
+        let urls = urls(&st.cfg);
+        // A bridge batch is already committed before we synchronize. One view
+        // per repo therefore contains the objects for every event in the batch;
+        // repeatedly syncing it per event only queues behind concurrent writers.
+        let mut views = std::collections::HashMap::new();
+        for ev in batch.iter().filter(|ev| !ev.ref_type.is_empty()) {
+            let view = match views.entry(ev.repo.as_str()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let (owner, name) = ev
+                        .repo
+                        .split_once('/')
+                        .ok_or_else(|| anyhow::anyhow!("bad repo id {}", ev.repo))?;
+                    let id = RepoId::new(owner, name)?;
+                    let view = repo::objects_view(&st, &id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    entry.insert(view)
+                }
+            };
+            self.deliver_ref(view, &urls, ev).await?;
         }
         Ok(())
     }

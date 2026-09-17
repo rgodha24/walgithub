@@ -103,7 +103,7 @@ async fn bridge_publishes_from_cursor_exactly_once() -> TestResult {
 
     // First catch-up: cold cursor → everything readable (seq 1..=2).
     let r = bridge.catch_up(&id).await?;
-    assert_eq!((r.from_seq, r.head_seq, r.emitted, r.gap), (0, 2, 2, None));
+    assert_eq!((r.from_seq, r.head_seq, r.emitted), (0, 2, 2));
     let got = wait_for(&captured, 2).await;
     assert_eq!(got[0]["action"], "create");
     assert_eq!(
@@ -242,8 +242,8 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
     assert!(err.to_string().contains("webhook sink"), "{err:#}");
     assert_eq!(
         cursor_seq(&server, "t", "r").await,
-        None,
-        "cursor must not advance"
+        Some(0),
+        "initial boundary is durable but must not advance"
     );
 
     let resp = reqwest::Client::new()
@@ -255,5 +255,147 @@ async fn bridge_sink_failure_keeps_the_cursor() -> TestResult {
         .send()
         .await?;
     assert_eq!(resp.status(), 503, "non-2xx so Pub/Sub redelivers");
+    Ok(())
+}
+
+/// A webhook is still in flight while two checkpoints remove its next batch
+/// from the manifest. Kill the bridge before ACK, then recover from the bucket
+/// on a fresh instance: both the in-flight event and the unseen ones must arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_replays_checkpointed_events_after_interrupted_first_delivery() -> TestResult {
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let captured: Captured = Default::default();
+    let app = axum::Router::new().route(
+        "/events",
+        axum::routing::post({
+            let entered = entered.clone();
+            let permits = permits.clone();
+            let captured = captured.clone();
+            move |axum::Json(batch): axum::Json<Vec<serde_json::Value>>| {
+                let (entered, permits, captured) =
+                    (entered.clone(), permits.clone(), captured.clone());
+                async move {
+                    captured.lock().unwrap().extend(batch);
+                    entered.notify_one();
+                    permits.acquire().await.unwrap().forget();
+                    axum::http::StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/events", listener.local_addr()?);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    server.put_repo("t", "r").await?;
+    let id: walgit_git::RepoId = "t/r".parse()?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(
+        &src,
+        &["remote", "add", "origin", &server.repo_url("t", "r")],
+    )?;
+    git_in(&src, &["push", "-u", "origin", "main"])?;
+    let bridge = server.state.bridge.clone().unwrap();
+    let task = tokio::spawn({
+        let id = id.clone();
+        async move { bridge.catch_up(&id).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified()).await?;
+    let handle = server.state.registry.open(&id).await?;
+    for message in ["second", "third"] {
+        git_in(&src, &["commit", "--allow-empty", "-m", message])?;
+        git_in(&src, &["push"])?;
+        handle.write_checkpoint().await?;
+    }
+    assert_eq!(handle.manifest().min_seq, 4);
+    assert!(handle.manifest().log_segments.is_empty());
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(0));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let store = server.store.clone();
+    drop(server);
+    // Ignore the unacknowledged first attempt; the retried batch must contain
+    // all three committed ref updates, in order, from a cold cache.
+    captured.lock().unwrap().clear();
+    permits.add_permits(10);
+    let restarted =
+        Server::start_with_store_and_tweak(store, bridge_cfg(&url, Duration::ZERO)).await?;
+    let report = restarted
+        .state
+        .bridge
+        .as_ref()
+        .unwrap()
+        .catch_up(&id)
+        .await?;
+    assert_eq!(
+        (report.from_seq, report.head_seq, report.emitted),
+        (0, 3, 3)
+    );
+    let got = captured.lock().unwrap().clone();
+    assert_eq!(
+        got.iter()
+            .map(|ev| ev["_walgit"]["seq"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["1", "2", "3"]
+    );
+    assert_eq!(cursor_seq(&restarted, "t", "r").await, Some(3));
+    assert_eq!(
+        restarted
+            .state
+            .bridge
+            .as_ref()
+            .unwrap()
+            .catch_up(&id)
+            .await?
+            .emitted,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_missing_history_does_not_advance_cursor() -> TestResult {
+    use walgit_store::ObjectStore;
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    server.put_repo("t", "r").await?;
+    let id = "t/r".parse()?;
+    let bridge = server.state.bridge.as_ref().unwrap();
+    bridge.catch_up(&id).await?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(&src, &["push", &server.repo_url("t", "r"), "main"])?;
+    let handle = server.state.registry.open(&id).await?;
+    let checkpoint = handle.write_checkpoint().await?;
+    handle.store().delete(&checkpoint.key, None).await?;
+    assert!(bridge.catch_up(&id).await.is_err());
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(0));
+    assert!(captured.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bridge_first_pass_after_checkpoint_replays_retained_history() -> TestResult {
+    let (url, captured) = webhook().await;
+    let server = Server::start_with_tweak(bridge_cfg(&url, Duration::ZERO)).await?;
+    server.put_repo("t", "r").await?;
+    let id = "t/r".parse()?;
+    let src = TestRepo::synthetic(1, 1)?;
+    git_in(&src, &["branch", "-M", "main"])?;
+    git_in(&src, &["push", &server.repo_url("t", "r"), "main"])?;
+    server
+        .state
+        .registry
+        .open(&id)
+        .await?
+        .write_checkpoint()
+        .await?;
+    assert_eq!(cursor_seq(&server, "t", "r").await, None);
+    let report = server.state.bridge.as_ref().unwrap().catch_up(&id).await?;
+    assert_eq!((report.from_seq, report.emitted), (0, 1));
+    assert_eq!(captured.lock().unwrap()[0]["_walgit"]["seq"], "1");
+    assert_eq!(cursor_seq(&server, "t", "r").await, Some(1));
     Ok(())
 }
