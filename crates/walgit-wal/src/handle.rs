@@ -649,11 +649,7 @@ impl RepoHandle {
                 let m = manifest.clone();
                 let task_span = task.as_ref().map(|t| t.span());
                 crate::sync::on_bulk_runtime(async move {
-                    let work = async {
-                        crate::sync::reconcile_packs(&arc, &m, level).await?;
-                        arc.local.refresh_async().await?;
-                        Ok::<(), WalError>(())
-                    };
+                    let work = crate::sync::reconcile_packs(&arc, &m, level);
                     match task_span {
                         Some(sp) => work.instrument(sp).await,
                         None => work.await,
@@ -662,11 +658,7 @@ impl RepoHandle {
                 .await
             }
             None => {
-                let res = async {
-                    crate::sync::reconcile_packs(self, &manifest, level).await?;
-                    self.local.refresh_async().await?;
-                    Ok::<(), WalError>(())
-                };
+                let res = crate::sync::reconcile_packs(self, &manifest, level);
                 match &task {
                     Some(t) => res.instrument(t.span()).await,
                     None => res.await,

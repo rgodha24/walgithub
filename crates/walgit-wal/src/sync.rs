@@ -110,7 +110,7 @@ pub(crate) async fn freshness_check(
 }
 
 /// Download a pack+idx from the store and install it into the local repo.
-/// Uses a temp file, then `install_pack` (atomic rename).
+/// Uses a temp file, then atomic rename; reconciliation refreshes the completed batch.
 pub(crate) async fn download_and_install_pack(
     store: &Prefixed,
     local: &LocalRepo,
@@ -200,10 +200,7 @@ pub(crate) async fn download_and_install_pack(
         r?;
     }
 
-    local
-        .install_pack(&pack_path, &idx_path, &extra)
-        .instrument(span.clone())
-        .await?;
+    span.in_scope(|| local.install_pack_files(&pack_path, &idx_path, &extra))?;
     if pack.kind == walgit_proto::v1::PackKind::History as i32 {
         local.mark_history_pack(&oid, &pack.derived_from).await?;
         tracing::info!(checksum = %checksum, base = %pack.derived_from, bytes = pack.pack_size, "history pack installed (commits + trees local)");
@@ -283,10 +280,7 @@ pub(crate) async fn link_and_install_pack(
     let link = tmp_dir.join(format!("pack-{checksum}.pack"));
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(target, &link)?;
-    local
-        .install_pack(&link, &idx_path, &extra)
-        .instrument(span.clone())
-        .await?;
+    span.in_scope(|| local.install_pack_files(&link, &idx_path, &extra))?;
     tracing::info!(checksum = %checksum, target = %target.display(), "base pack linked from store mount");
     // A history pack already installed for this base: the midx must now
     // cover both (history preferred) — see LocalRepo::write_history_midx.
@@ -759,6 +753,8 @@ pub(crate) async fn reconcile_packs_inner(
         handle.state.lock().pending_pack_removals = still_pending;
     }
 
+    // Reopen once for the batch, before advertising its objects as available.
+    local.refresh_async().await?;
     {
         let mut state = handle.state.lock();
         state.packs_revision = manifest.revision;

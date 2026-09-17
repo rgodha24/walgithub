@@ -308,6 +308,69 @@ async fn test_two_registries_cross_sync() {
 }
 
 #[tokio::test]
+async fn test_cold_pack_batch_and_later_push_are_readable() {
+    let cache = tempfile::tempdir().unwrap();
+    let store = MemoryStore::shared();
+    let writer = Registry::new(
+        store.clone(),
+        Arc::new(make_config(&cache.path().join("writer"), 0)),
+    );
+    let reader = Registry::new(
+        store,
+        Arc::new(make_config(&cache.path().join("reader"), 0)),
+    );
+    let id = repo_id("test", "pack_batch");
+    let source = writer.create(&id, ObjectFormat::Sha1).await.unwrap();
+    let work = WorkRepo::new();
+    let mut commits = Vec::<String>::new();
+    let mut cold = None;
+
+    for batch in 0..2 {
+        for i in 0..16 {
+            let head = work.commit(&format!("batch_{batch}_{i}"), &format!("{batch}/{i}"));
+            let previous = commits.last().map(String::as_str).unwrap_or("");
+            let pack = if previous.is_empty() {
+                work.create_pack()
+            } else {
+                work.create_incremental_pack(&head, previous)
+            };
+            let ingested = ingest_pack_data(&source, pack).await.unwrap();
+            let result = source
+                .publish_push(
+                    Some(ingested),
+                    make_txn(vec![("refs/heads/main", previous, &head)]),
+                    HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert!(result.per_ref.iter().all(|(_, r)| r.is_ok()));
+            commits.push(head);
+        }
+        if cold.is_none() {
+            cold = Some(reader.open(&id).await.unwrap());
+        }
+        let target = cold.as_ref().unwrap();
+        let guard = target.sync().await.unwrap();
+        assert_eq!(target.local().packs().unwrap().len(), commits.len());
+        for commit in &commits {
+            let oid = gix_hash::ObjectId::from_hex(commit.as_bytes()).unwrap();
+            assert!(target.local().has_object(&oid), "missing commit {commit}");
+        }
+        let refs = target.local().refs().unwrap();
+        assert_eq!(
+            &refs
+                .refs
+                .iter()
+                .find(|r| r.name == "refs/heads/main")
+                .unwrap()
+                .oid,
+            commits.last().unwrap()
+        );
+        drop(guard);
+    }
+}
+
+#[tokio::test]
 async fn test_concurrent_different_refs() {
     let cache = tempfile::tempdir().unwrap();
     let store = MemoryStore::shared();

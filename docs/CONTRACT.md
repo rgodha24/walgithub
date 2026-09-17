@@ -57,6 +57,8 @@ impl LocalRepo {
       pub pack_size: u64, pub idx_size: u64, pub object_count: u64 }
   /// Atomically move downloaded files into objects/pack/ (rename), then refresh.
   pub async fn install_pack(&self, pack: &Path, idx: &Path, extra: &[PathBuf]) -> Result<(), GitError>;
+  /// Batch install: move files only; call refresh_async after the batch, before serving objects.
+  pub fn install_pack_files(&self, pack: &Path, idx: &Path, extra: &[PathBuf]) -> Result<(), GitError>;
   /// Delete .pack/.idx/.rev/.bitmap. Caller guarantees no readers (wal holds a lock).
   pub fn remove_pack(&self, checksum: &gix_hash::oid) -> Result<(), GitError>;
   pub fn packs(&self) -> Result<Vec<PackInfo>, GitError>;

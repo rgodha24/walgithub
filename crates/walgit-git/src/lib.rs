@@ -905,6 +905,18 @@ impl LocalRepo {
         idx: &Path,
         extra: &[PathBuf],
     ) -> Result<(), GitError> {
+        self.install_pack_files(pack, idx, extra)?;
+        self.refresh_async().await
+    }
+
+    /// Move pack files into place without reopening the object database.
+    /// Batch callers must call `refresh_async` after all installs complete.
+    pub fn install_pack_files(
+        &self,
+        pack: &Path,
+        idx: &Path,
+        extra: &[PathBuf],
+    ) -> Result<(), GitError> {
         let pack_dir = self.objects_pack_dir();
         std::fs::create_dir_all(&pack_dir).map_err(GitError::Io)?;
         let dst_pack = pack_dir.join(pack.file_name().unwrap());
@@ -915,7 +927,6 @@ impl LocalRepo {
             let dst = pack_dir.join(e.file_name().unwrap());
             rename_atomic(e, &dst)?;
         }
-        self.refresh_async().await?;
         Ok(())
     }
 

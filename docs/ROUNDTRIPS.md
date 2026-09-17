@@ -41,6 +41,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 |---|---|---|---|
 | Any read (`info/refs`, ls-refs, web refs/resolve) | 1 cond GET (or 0 within `freshness_ttl`) | 1 | `sync.rs::freshness_check` |
 | Cold Refs sync | 1 manifest GET → 1 round (checkpoint refs ∥ log tail segments) | no checkpoint: 1 + tail (2 with one segment); checkpoint: 2 + tail | `registry.rs::open`, `sync.rs` |
+| Pack materialization (2026-09-17) | unchanged: pack ∥ idx ∥ advertised side-files, up to 8 packs concurrently; refresh the local object database after the batch instead of after every pack | unchanged; 0 added requests or LISTs | `sync.rs::reconcile_packs_inner` |
 | Push request / publish (`process_batch`) | 1 freshness GET → pack PUT ∥ idx PUT ∥ log PUT (1 round) → manifest CAS (1 round) | request: 5; already-synced publish: 4 | `publish.rs` |
 | Compaction publish | same shape as push | — | `publish.rs::publish_compact_impl` |
 | Checkpoint (includes folded segment index + previous pointer, no added requests) | 1 cond GET (freshness) → refs PUT ∥ checkpoint PUT → manifest CAS | 3 rounds, 4 requests (was 6/6 until 2026-08-22: a bundle-list GET before the checkpoint PUT and a log GET for provenance times sat in the chain; times now come from the writer's own applied state, `bundle_key` is no longer looked up) | `checkpoint.rs` |
