@@ -2002,17 +2002,15 @@ async fn facade_config_compacts_when_base_refs_are_outside_checkpoint_window() -
     let packaged = walgit_config::Config::parse(include_str!("../../../deploy/walgithub.toml"))?;
     assert!(!packaged.bundles.enabled);
     assert!(!packaged.bundles.advertise);
-    let server = step!(
-        "start",
-        Server::start_with_tweak(|c| {
-            c.bundles = packaged.bundles.clone();
-            c.compaction.enabled = true;
-            c.compaction.trigger_packs = 3;
-            c.maintenance.checkpoints = false;
-            c.maintenance.fsck_interval = std::time::Duration::ZERO;
-            c.wal.snapshot_every_entries = 0;
-        })
-    )?;
+    let configure = |c: &mut walgit_config::Config| {
+        c.bundles = packaged.bundles.clone();
+        c.compaction.enabled = true;
+        c.compaction.trigger_packs = 3;
+        c.maintenance.checkpoints = false;
+        c.maintenance.fsck_interval = std::time::Duration::ZERO;
+        c.wal.snapshot_every_entries = 0;
+    };
+    let server = step!("start", Server::start_with_tweak(configure))?;
     step!("put repo", server.put_repo("o", "r"))?;
     let src = tempfile::tempdir()?;
     git_in(src.path(), &["init", "-q", "-b", "main"])?;
@@ -2061,9 +2059,8 @@ async fn facade_config_compacts_when_base_refs_are_outside_checkpoint_window() -
     let enabled = step!(
         "bundles enabled",
         server.start_sibling_with(|c| {
-            c.bundles = packaged.bundles.clone();
+            configure(c);
             c.bundles.enabled = true;
-            c.maintenance.checkpoints = false;
         })
     )?;
     assert!(matches!(
@@ -2096,7 +2093,15 @@ async fn facade_config_compacts_when_base_refs_are_outside_checkpoint_window() -
     assert_eq!(step!("idle", next_unit(&server.state, &id))?, Unit::Idle);
 
     // The serving cache must not hide missing objects after compaction.
-    let cold = step!("cold instance", server.start_sibling_with(|_| {}))?;
+    let cold = step!("cold instance", server.start_sibling_with(configure))?;
+    let capabilities = step!(
+        "capabilities",
+        cold.get_text(
+            "/o/r.git/info/refs?service=git-upload-pack",
+            &[("Git-Protocol", "version=2")],
+        )
+    )?;
+    assert!(!capabilities.contains("bundle-uri"), "{capabilities}");
     let clone = tempfile::tempdir()?;
     git(
         &[
