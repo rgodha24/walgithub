@@ -1999,6 +1999,8 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn facade_config_compacts_when_base_refs_are_outside_checkpoint_window() -> anyhow::Result<()>
 {
+    use walgit_server::maintain::{Unit, next_unit, run_pass};
+
     let packaged = walgit_config::Config::parse(include_str!("../../../deploy/walgithub.toml"))?;
     assert!(!packaged.bundles.enabled);
     assert!(!packaged.bundles.advertise);
