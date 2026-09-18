@@ -36,6 +36,7 @@ jobs:
         run: rustup show && cargo --version && git --version
       - uses: Swatinem/rust-cache@v2
         with:
+          key: scoped-tests-v1
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
@@ -58,13 +59,17 @@ jobs:
 
       - name: Compile cold workspace before timed checks
         timeout-minutes: 45
-        run: cargo build --workspace --all-targets --locked
+        run: |
+          cargo build --workspace --all-targets --locked
+          # Package subsets resolve different dependency features than the workspace build.
+          cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests --no-run --locked
+          cargo test -p walgit-server --tests --no-run --locked
+      - run: just test
       - run: just warnings
       - run: just clippy
-      - run: just test
 
   e2e:
-    name: e2e
+    name: Git and editor contracts
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
@@ -89,10 +94,23 @@ jobs:
           cache-dependency-path: web/pnpm-lock.yaml
       - name: Build the SPA and the SDK
         run: just web-build
-      - name: Compile cold E2E binary before timed tests
+      - name: Compile cold contract binaries before timed tests
+        id: contracts
         timeout-minutes: 45
-        run: cargo test -p walgit-server --test e2e --no-run --locked
-      - run: just e2e
+        run: cargo test -p walgit-server --test e2e --test github --test github_reads --test github_graphql --test github_prs --test github_webhooks --test events --no-run --locked
+      - name: Editor facade contracts
+        shell: bash
+        run: just test-editor 2>&1 | tee editor-contracts.log
+      - name: Git protocol contracts
+        if: ${{ !cancelled() && steps.contracts.outcome == 'success' }}
+        shell: bash
+        run: just e2e 2>&1 | tee git-contracts.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-test-logs
+          path: '*-contracts.log'
+          retention-days: 14
 
   container:
     name: release container
@@ -138,14 +156,26 @@ jobs:
             -e WALGIT__STORE__S3__FORCE_PATH_STYLE=true \
             -e WALGIT__SERVER__PUBLIC_URL=http://127.0.0.1:8097 \
             walgithub:smoke
-      - name: Verify Git, PR webhooks, and persistence
-        timeout-minutes: 5
-        run: python3 scripts/container-smoke.py
+      - name: Verify editor publish, concurrent Git, and cold webhook recovery
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          mkdir -p smoke-logs
+          python3 -u scripts/container-smoke.py 2>&1 | tee smoke-logs/test.log
       - name: Container logs
-        if: failure()
-        run: docker logs walgithub-smoke || true
+        if: always()
+        run: |
+          mkdir -p smoke-logs
+          docker logs walgithub-smoke > smoke-logs/facade.log 2>&1 || true
+          docker compose logs rustfs > smoke-logs/store.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: editor-container-logs
+          path: smoke-logs/
+          retention-days: 14
       - name: Clean up
         if: always()
         run: |
-          docker rm -f walgithub-smoke || true
+          docker rm -fv walgithub-smoke || true
           docker compose down -v
