@@ -10,6 +10,10 @@ mode = "none"
 [server.tls]
 mode = "off"
 
+[bundles]
+enabled = false
+advertise = false
+
 [github]
 enabled = true
 webhook_poll_interval = "1s"

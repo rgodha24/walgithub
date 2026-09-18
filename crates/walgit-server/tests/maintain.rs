@@ -1993,3 +1993,132 @@ async fn maintainer_pass_brings_an_overgrown_bundle_list_to_retention() -> anyho
     assert_eq!(again.bundles.len(), 5);
     Ok(())
 }
+
+/// A base older than the current checkpoint used to select a failing weekly
+/// bundle forever, leaving thousands of fresh packs uncompacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn facade_config_compacts_when_base_refs_are_outside_checkpoint_window() -> anyhow::Result<()>
+{
+    let packaged = walgit_config::Config::parse(include_str!("../../../deploy/walgithub.toml"))?;
+    assert!(!packaged.bundles.enabled);
+    assert!(!packaged.bundles.advertise);
+    let server = step!(
+        "start",
+        Server::start_with_tweak(|c| {
+            c.bundles = packaged.bundles.clone();
+            c.compaction.enabled = true;
+            c.compaction.trigger_packs = 3;
+            c.maintenance.checkpoints = false;
+            c.maintenance.fsck_interval = std::time::Duration::ZERO;
+            c.wal.snapshot_every_entries = 0;
+        })
+    )?;
+    step!("put repo", server.put_repo("o", "r"))?;
+    let src = tempfile::tempdir()?;
+    git_in(src.path(), &["init", "-q", "-b", "main"])?;
+    git_in(src.path(), &["config", "user.email", "t@t"])?;
+    git_in(src.path(), &["config", "user.name", "Tester"])?;
+    std::fs::write(src.path().join("base.txt"), "base survives compaction\n")?;
+    git_in(src.path(), &["add", "."])?;
+    git_in(src.path(), &["commit", "-q", "-m", "base"])?;
+    git(
+        &["push", "-q", &server.repo_url("o", "r"), "main"],
+        src.path(),
+    )?;
+    let id = walgit_git::RepoId::new("o", "r")?;
+    let handle = step!("open", server.state.registry.open(&id))?;
+    step!(
+        "build base",
+        walgit_server::ops::compact_repo(
+            &handle,
+            &handle.effective_config(),
+            walgit_server::ops::CompactRequest {
+                force: true,
+                rebuild_base: true
+            },
+            &|_| {},
+        )
+    )?;
+    let base = walgit_wal::base_pack(&handle.manifest())
+        .expect("base pack")
+        .clone();
+    for i in 0..3 {
+        std::fs::write(
+            src.path().join(format!("page{i}.mdx")),
+            format!("page {i}\n"),
+        )?;
+        git_in(src.path(), &["add", "."])?;
+        git_in(src.path(), &["commit", "-q", "-m", &format!("page {i}")])?;
+        git(
+            &["push", "-q", &server.repo_url("o", "r"), "main"],
+            src.path(),
+        )?;
+    }
+    step!("checkpoint", handle.write_checkpoint())?;
+    assert!(handle.manifest().min_seq > base.seq);
+    assert!(step!("old base refs", handle.refs_at_seq(base.seq)).is_err());
+    // The old configuration repeatedly chooses the unbuildable weekly bundle.
+    let enabled = step!(
+        "bundles enabled",
+        server.start_sibling_with(|c| {
+            c.bundles = packaged.bundles.clone();
+            c.bundles.enabled = true;
+            c.maintenance.checkpoints = false;
+        })
+    )?;
+    assert!(matches!(
+        step!("blocked unit", next_unit(&enabled.state, &id))?,
+        Unit::BundleSlot(..)
+    ));
+    let blocked = step!("blocked pass", run_pass(&enabled.state))?;
+    assert_eq!(blocked.compactions, 0, "{blocked:?}");
+    assert_eq!(blocked.skipped, 1, "{blocked:?}");
+    assert!(matches!(
+        step!("still blocked", next_unit(&enabled.state, &id))?,
+        Unit::BundleSlot(..)
+    ));
+
+    let packs_before = handle.manifest().packs.len();
+    assert_eq!(
+        step!("next unit", next_unit(&server.state, &id))?,
+        Unit::Compact
+    );
+    let report = step!("maintenance", run_pass(&server.state))?;
+    assert!(report.compactions > 0, "{report:?}");
+    assert!(handle.manifest().packs.len() < packs_before);
+    assert!(
+        handle
+            .manifest()
+            .packs
+            .iter()
+            .any(|p| p.checksum == base.checksum)
+    );
+    assert_eq!(step!("idle", next_unit(&server.state, &id))?, Unit::Idle);
+
+    // The serving cache must not hide missing objects after compaction.
+    let cold = step!("cold instance", server.start_sibling_with(|_| {}))?;
+    let clone = tempfile::tempdir()?;
+    git(
+        &[
+            "clone",
+            "-q",
+            &cold.repo_url("o", "r"),
+            clone.path().to_str().unwrap(),
+        ],
+        src.path(),
+    )?;
+    git_in(clone.path(), &["fsck", "--full"])?;
+    assert_eq!(
+        git_in(clone.path(), &["rev-parse", "HEAD"])?,
+        git_in(src.path(), &["rev-parse", "HEAD"])?
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone.path().join("base.txt"))?,
+        "base survives compaction\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone.path().join("page2.mdx"))?,
+        "page 2\n"
+    );
+    Ok(())
+}
