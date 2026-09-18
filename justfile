@@ -85,6 +85,10 @@ test:
     {{t5}} cargo test -p walgit-store -p walgit-git -p walgit-wal -p walgit-bundle --tests
     {{t5}} cargo test -p walgit-server --test web_api --test web_ui --test api_v1 --test static_http --test maintain --test routing_prefix --test lfs_upstream --test drain --test github --test github_webhooks
 
+# Editor facade contracts: REST reads, GraphQL saves, PRs and durable webhook delivery.
+test-editor:
+    {{t5}} cargo test -p walgit-server --test github --test github_reads --test github_graphql --test github_prs --test github_webhooks --test events
+
 # Smart-HTTP end-to-end against real git (≈ 20 s) — run when touching smart.rs/receive/upload-pack/wal.
 e2e *ARGS:
     {{t10}} cargo test -p walgit-server --test e2e {{ARGS}}
@@ -102,8 +106,13 @@ warnings:
         printf '%s\n' "$out"
         echo; echo "cargo build failed — fix the errors above"; exit 1
     fi
-    if printf '%s\n' "$out" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
-        printf '%s\n' "$out" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
+    # CI sets CARGO_TERM_COLOR=always, which prefixes every diagnostic with ANSI
+    # escapes — an anchored `^warning:` then never matches and this gate passes on
+    # a warning-bearing tree (issue #29). Strip the escapes before matching; the
+    # ESC is embedded as a bash $'…' literal so BSD and GNU sed both take it.
+    plain="$(printf '%s\n' "$out" | sed $'s/\x1b\\[[0-9;]*m//g')"
+    if printf '%s\n' "$plain" | grep -qE '^warning: (unused|function|variable|field|method|struct|enum|never|dead|irrefutable|unreachable|value assigned|deprecated|trait|type|constant|static|associated)'; then
+        printf '%s\n' "$plain" | grep -E '^warning' -A4 | grep -vE '^warning: `walgit-[a-z]+`'
         echo; echo "rustc warnings present — fix them (just warnings is part of just ci and the deploy preflight)"; exit 1
     fi
     echo "no rustc warnings"
@@ -115,7 +124,7 @@ clippy:
     {{t15}} cargo clippy --workspace --all-targets -- -D warnings
 
 # Everything that must be green before a merge (what CI runs).
-ci: warnings clippy test e2e
+ci: warnings clippy test test-editor e2e
 
 # Slow tier: #[ignore]d benches/soaks (20k-ref push, 466k-ref render, ...).
 test-slow:
