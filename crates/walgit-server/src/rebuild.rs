@@ -108,6 +108,11 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<u64> {
     let mut bytes = 0u64;
     for ent in std::fs::read_dir(src)? {
         let ent = ent?;
+        // Locks belong to the live Git process, not the copied repository.
+        // A copied lock has no owner in this isolated scratch directory.
+        if ent.file_name().to_string_lossy().ends_with(".lock") {
+            continue;
+        }
         let from = ent.path();
         let to = dst.join(ent.file_name());
         let ft = ent.file_type()?;
@@ -423,4 +428,26 @@ fn start_scratch(
     write_marker(marker_path, &m)?;
     abort_after(handle.id(), Phase::Copied)?;
     Ok(m)
+}
+
+#[cfg(test)]
+mod copy_tests {
+    #[test]
+    fn scratch_copy_excludes_live_git_locks() -> anyhow::Result<()> {
+        let source = tempfile::tempdir()?;
+        let target = tempfile::tempdir()?;
+        let graphs = source.path().join("objects/info/commit-graphs");
+        std::fs::create_dir_all(&graphs)?;
+        std::fs::write(graphs.join("commit-graph-chain.lock"), b"in flight")?;
+        std::fs::write(graphs.join("commit-graph-chain"), b"committed")?;
+        super::copy_tree(source.path(), target.path())?;
+        let copied = target.path().join("objects/info/commit-graphs");
+        assert!(!copied.join("commit-graph-chain.lock").exists());
+        assert_eq!(
+            std::fs::read(copied.join("commit-graph-chain"))?,
+            b"committed"
+        );
+        assert!(graphs.join("commit-graph-chain.lock").exists());
+        Ok(())
+    }
 }

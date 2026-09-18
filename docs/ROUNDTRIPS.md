@@ -53,6 +53,7 @@ right shape. This document is the thinking tool; apply it to every protocol chan
 | Repository listing (`/api/v1/owners*`, `/services/api/owners*`, maintainer/bridge passes) | 0 within `LIST_TTL` (30 s, per instance); else delimited `repos/` → (delimited `repos/<o>/` ∥ owners) → (HEAD `manifest.pb` ∥ repos): 3 rounds | 1 + owners + repos | `registry.rs::list` |
 | GitHub integration setup | registry GET → CAS PUT; bounded conflict retry | 2 per successful update | `github/integrations.rs`; setup only, no Git request overhead |
 | GitHub webhook catch-up | registry GET → per-target cursor/manifest/log reads → one objects view per repo/batch → webhook → cursor CAS | first use walks the checkpoint chain to find its initial boundary and adds one cursor Create; a lagging cursor adds one GET per traversed checkpoint plus archived segments; normal caught-up reads unchanged, no LIST | `bridge.rs`; independent installation cursors, push budget unchanged |
+| S3 transient faults (2026-09-17) | unchanged healthy path; SDK errors now retain retryability for existing WAL backoff/re-read handling after a failed request | 0 added healthy requests; extra retries only after transient failure | `walgit-store/src/s3.rs` |
 | Orphan log slot (failure path only) | +1 fresh manifest GET, +HEAD per probe, +Create at next seq | — | `publish.rs::claim_log_slot` |
 
 `healthy_request_round_trip_budgets` in `crates/walgit-server/tests/sim.rs` pins the healthy MemoryStore
