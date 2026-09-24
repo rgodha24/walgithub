@@ -100,6 +100,7 @@ table is a GitHub-shaped 404, never a fall-through to walgit's repo-prefix dispa
 | OAuth | `GET /login/oauth/authorize`, `POST /login/oauth/access_token` | `auth.rs`: the web flow agrees immediately |
 | Ref reads | `GET …/repos/{o}/{r}`, `…/commits` (`?sha=`, `?path=`), `…/commits/{ref}`, `…/git/commits/{sha}`, `…/branches`, `…/branches/{branch}`, `…/git/ref/{ref}`, `…/git/refs[/{ref}]`, `…/git/matching-refs/{ref}` | `repo.rs` on the ref snapshot; listings carry `Link` (`next`/`prev`/`first`, never `last`) |
 | Object reads | `GET …/git/trees/{sha}` (`?recursive=`), `…/git/blobs/{sha}`, `…/contents[/{path}]` (`?ref=`), `…/compare/{base}...{head}`, `…/readme` (`?ref=`), `…/zipball[/{ref}]`, `…/tarball[/{ref}]` | `reads.rs`, `contents.rs`, `compare.rs`, `diff.rs` — stock `git` on the **bare** serving copy |
+| Topics | `GET\|PUT …/repos/{o}/{r}/topics` | `topics.rs` over one `github/topics.json` per repository (§6a) |
 | Branch protection | `GET …/rules/branches/{branch}`, `…/branches/{branch}/protection`, `PUT …/_dev/repos/{o}/{r}/protection` | `reads.rs` over one `github/protection.json` per repository (§6a) |
 | Ref writes | `POST …/git/refs`, `PATCH\|DELETE …/git/refs/{ref}` | `write.rs`, walgit's publish path (§7) |
 | Pull requests | `POST\|GET …/pulls`, `GET\|PATCH …/pulls/{n}`, `…/pulls/{n}/{files,commits,merge,reviews,comments,requested_reviewers}`, `…/pulls/{n}/reviews/{id}[/events]`, `GET\|POST …/issues/{n}/comments`, `GET\|PATCH\|DELETE …/issues/comments/{id}`, reactions on both comment kinds, `GET …/issues/{n}`, `GET …/commits/{sha}/pulls`, `POST …/merges`, `POST /repos/{t}/{t}/generate`, `GET /search/issues` | `prs.rs` + `pr_store.rs` + `merge.rs` (§9) |
@@ -133,6 +134,7 @@ catch-all and both a branch name and a ref may contain `/`:
 | `reads.rs` | Trees, blobs, the README, archives, branch protection, and `ls_tree`/`base64_github`/`wants_raw`/`resolve_ref`. |
 | `contents.rs` | `contents/{path}` in its four representations, plus `entry_type`/`entry_json`/`file_json`/`file_response`. |
 | `compare.rs` | Three-dot compare. |
+| `topics.rs` | Repository topics: the two routes, and `load` for every surface that reports them. |
 | `diff.rs` | The only `files[]` renderer: `FileChange`, `changed_files`, `stats`, `file_json`, all `git diff-tree` on the bare copy. Compare and `pulls/{n}/files` are the same three passes. |
 | `graphql/` | `POST /graphql`: `parse.rs` (document → field tree), `ops.rs` (queries), `mutate.rs` (mutations), `blame.rs`, `error.rs` (GitHub's error `type`s). PR state is `pr_store.rs`'s, not a second copy. |
 
@@ -162,6 +164,14 @@ catch-all and both a branch name and a ref may contain `/`:
   `<repo>-<shortsha>/` prefix the template extractor strips. Both callers read `response.data` as an
   `ArrayBuffer` and the tarball caller sets `redirect: "follow"`, so a body on the first response is what
   they end up with either way — and it saves inventing a second origin that has to be reachable.
+- **Topics.** `PUT …/repos/{o}/{r}/topics` with `{"names": [...]}` replaces the list at
+  `github/topics.json` under the repository's prefix (a CAS on the object's version, like protection).
+  It stores what GitHub stores: names folded to lowercase, repeats dropped, order kept; a name outside
+  GitHub's rule (lowercase letters, digits and hyphens, starting with a letter or digit, at most 50
+  characters) or more than 20 names is a 422. The list is reported by `GET …/topics`, `topics` on
+  `GET …/repos/{o}/{r}`, `repository.topics` on every webhook delivery, and GraphQL's
+  `repositoryTopics` and `search … in:topics` (§10). `installation/repositories` still reports `[]`:
+  nothing reads topics there and it would cost a GET per listed repository.
 - **Branch protection.** GitHub's rulesets API is an order of magnitude more surface than anything reads,
   so the facade stores the answer and renders the rule objects from it. The object is
   `github/protection.json` under the repository's prefix:
@@ -389,7 +399,7 @@ it**. Every document a client sends is a string literal in its own source — `d
 ("POST /graphql") lists all of them, their variables and the exact fields destructured off the answer — so
 the handler parses the document with `graphql-parser`, takes its single operation, resolves each argument
 against the JSON `variables`, and dispatches on field names. A schema, a resolver graph and an executor
-would be a large amount of machinery to answer eleven known questions.
+would be a large amount of machinery to answer thirteen known questions.
 
 Served today:
 
@@ -400,7 +410,8 @@ Served today:
 | `repository { refs(refPrefix, first, after, query) }` | the branch listing, one page per call |
 | `repository { ref { target { blame(path) { ranges } } } }` | `git blame --porcelain` |
 | `repositoryOwner(login) { repositories(first, after, orderBy) }` | every repository of that owner in the bucket |
-| `search(query, type: REPOSITORY, first)` | the same listing, filtered by the search string |
+| `search(query, type: REPOSITORY, first)` | the same listing, filtered by the search string: free terms match the name, or the topics under `in:topics`; `topic:` keeps repositories carrying that topic |
+| `… on Repository { repositoryTopics(first, after) }` | the stored topics (§6a), on any repository node; loaded only when selected |
 | `mutation createCommitOnBranch(input)` | a commit through `write::commit_on_ref` |
 | `mutation markPullRequestReadyForReview(input)` / `convertPullRequestToDraft(input)` | `draft` on the PR JSON |
 | `mutation addPullRequestReviewThread(input)` | a thread appended to the PR JSON |
@@ -421,7 +432,7 @@ Conventions, all of them the call sites':
   (the caller swallows errors to `null`, so a miss must not look like an outage).
 - Each arm answers the **full** shape of its node, not only the selected fields — the documents are
   literals that get edited — but selection still decides work: `history` and `blame` are computed only when
-  they are asked for.
+  they are asked for, and `repositoryTopics` is read from the bucket only when it is selected.
 - `x-ratelimit-remaining` is never `0`: a zero makes the client sleep `retry-after + 1` seconds (61 by
   default) and retry once.
 
@@ -527,7 +538,7 @@ the minimum. `walgit.standalone.toml` sets none, so it already runs the bridge.
 
 `push` carries `ref`, `before`, `after` (forty zeros on a create or a delete), `created`, `deleted`,
 `forced` (`before` is not an ancestor of `after`), `size`, `repository` (the same shape every REST read
-renders), `installation.id`, `pusher`, `sender`, `head_commit` and `commits[]`. A commit's
+renders, with its `topics`), `installation.id`, `pusher`, `sender`, `head_commit` and `commits[]`. A commit's
 `added`/`modified`/`removed` come from `git log -1 --name-status --first-parent --root` on the bare serving
 copy; `size` is the whole range while `commits[]` is capped at **20** (GitHub's cap, and the consumer reads
 `commits.length < size` as "incomplete"). The newest 20 are kept, so `head_commit` is always the last entry

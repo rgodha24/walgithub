@@ -357,14 +357,15 @@ pub async fn get_repo(
     let id = repo_id(&owner, &name)?;
     let view = refs_view(&st, &id).await?;
     let urls = Urls::from_request(&st, &headers);
-    Ok(axum::Json(models::repository(
+    let mut body = models::repository(
         &urls,
         id.owner(),
         id.name(),
         &default_branch(&view.index),
         &pushed_at(&view.handle),
-    ))
-    .into_response())
+    );
+    body.topics = super::topics::load(&st, &id).await?;
+    Ok(axum::Json(body).into_response())
 }
 
 /// `GET /api/v3/installation/repositories` — only repositories selected for this installation.

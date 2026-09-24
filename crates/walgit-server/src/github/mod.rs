@@ -53,6 +53,7 @@ pub mod reads;
 pub mod repo;
 pub mod router;
 pub mod stubs;
+pub mod topics;
 pub mod webhook;
 pub mod write;
 

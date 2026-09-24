@@ -114,6 +114,17 @@ const SEARCH_REPOS: &str = "query($q: String!, $first: Int!) {
   search(query: $q, type: REPOSITORY, first: $first) { nodes { ... on Repository { nameWithOwner } } }
 }";
 
+// `listRepoTopics` sends one `fields` fragment inside two queries.
+const LIST_REPO_TOPICS: &str = "query($owner: String!, $cursor: String) {
+                    repositoryOwner(login: $owner) {
+                      repositories(first: 100, after: $cursor, orderBy: { field: PUSHED_AT, direction: DESC }) { nodes { ... on Repository { nameWithOwner repositoryTopics(first: 100) { nodes { topic { name } } } } }
+        pageInfo { hasNextPage endCursor } }
+                    }
+                  }";
+
+const SEARCH_REPO_TOPICS: &str = "query($q: String!) { search(query: $q, type: REPOSITORY, first: 50) { nodes { ... on Repository { nameWithOwner repositoryTopics(first: 100) { nodes { topic { name } } } } }
+        pageInfo { hasNextPage endCursor } } }";
+
 const CREATE_COMMIT: &str = "mutation CreateCommit($input: CreateCommitOnBranchInput!) {
   createCommitOnBranch(input: $input) { commit { url oid } }
 }";
@@ -559,5 +570,134 @@ async fn an_unserved_field_names_itself_at_200() -> TestResult {
     // A document that is not GraphQL is still a 200 with an error body.
     let body = gql(&s, "not graphql at all {{{", json!({})).await?;
     assert_eq!(body["errors"][0]["type"], "BAD_REQUEST", "{body}");
+    Ok(())
+}
+
+/// `topic { name }` of every node of a `repositoryTopics` connection.
+fn topic_names(node: &Value) -> Vec<String> {
+    node["repositoryTopics"]["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n["topic"]["name"].as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topics_set_over_rest_are_what_graphql_lists_and_searches() -> TestResult {
+    let s = server().await?;
+    let (_a, _) = fixture(&s, "acme", "docs")?;
+    let (_b, _) = fixture(&s, "acme", "handbook")?;
+
+    // PUT folds case and drops repeats; GET and the repository answer the same list.
+    let (status, body) = rest(
+        &s,
+        reqwest::Method::PUT,
+        "/repos/acme/docs/topics",
+        json!({ "names": ["Docs", "public-api", "docs"] }),
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(body["names"], json!(["docs", "public-api"]));
+    let (_, body) = rest(
+        &s,
+        reqwest::Method::GET,
+        "/repos/acme/docs/topics",
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(body["names"], json!(["docs", "public-api"]));
+    let (_, body) = rest(&s, reqwest::Method::GET, "/repos/acme/docs", Value::Null).await?;
+    assert_eq!(body["topics"], json!(["docs", "public-api"]));
+    let (_, body) = rest(
+        &s,
+        reqwest::Method::GET,
+        "/repos/acme/handbook/topics",
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(body["names"], json!([]));
+
+    // GitHub's topic rule is a 422, and nothing is stored.
+    let (status, _) = rest(
+        &s,
+        reqwest::Method::PUT,
+        "/repos/acme/docs/topics",
+        json!({ "names": ["not valid"] }),
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let (_, body) = rest(
+        &s,
+        reqwest::Method::GET,
+        "/repos/acme/docs/topics",
+        Value::Null,
+    )
+    .await?;
+    assert_eq!(body["names"], json!(["docs", "public-api"]));
+    let (status, _) = rest(
+        &s,
+        reqwest::Method::PUT,
+        "/repos/acme/nope/topics",
+        json!({ "names": ["docs"] }),
+    )
+    .await?;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+
+    // The owner listing: every repository, each with its own topics.
+    let body = gql(
+        &s,
+        LIST_REPO_TOPICS,
+        json!({ "owner": "acme", "cursor": null }),
+    )
+    .await?;
+    let nodes = data(&body)?["repositoryOwner"]["repositories"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let by_name = |name: &str| {
+        nodes
+            .iter()
+            .find(|n| n["nameWithOwner"] == name)
+            .map(topic_names)
+    };
+    assert_eq!(
+        by_name("acme/docs"),
+        Some(vec!["docs".to_string(), "public-api".to_string()])
+    );
+    assert_eq!(by_name("acme/handbook"), Some(Vec::new()));
+
+    // The search: a half-typed term matches a topic, not a name.
+    let body = gql(
+        &s,
+        SEARCH_REPO_TOPICS,
+        json!({ "q": "pub in:topics user:acme fork:true" }),
+    )
+    .await?;
+    let found = &data(&body)?["search"]["nodes"];
+    assert_eq!(found.as_array().map(Vec::len), Some(1), "{body}");
+    assert_eq!(found[0]["nameWithOwner"], "acme/docs");
+    assert_eq!(topic_names(&found[0]), vec!["docs", "public-api"]);
+    let body = gql(
+        &s,
+        SEARCH_REPO_TOPICS,
+        json!({ "q": "handbook in:topics user:acme fork:true" }),
+    )
+    .await?;
+    assert_eq!(data(&body)?["search"]["nodes"], json!([]));
+
+    // One repository, one page at a time.
+    let body = gql(
+        &s,
+        "query { repository(owner: \"acme\", name: \"docs\") { repositoryTopics(first: 1) { totalCount pageInfo { hasNextPage endCursor } nodes { topic { name } } } } }",
+        Value::Null,
+    )
+    .await?;
+    let topics = &data(&body)?["repository"]["repositoryTopics"];
+    assert_eq!(topics["totalCount"], 2);
+    assert_eq!(topics["pageInfo"]["hasNextPage"], true);
+    assert_eq!(topics["nodes"][0]["topic"]["name"], "docs");
     Ok(())
 }

@@ -16,12 +16,15 @@ use super::parse::Field;
 use crate::AppState;
 use crate::github::models::{CommitFacts, Urls, node_id};
 use crate::github::repo::{self, View};
+use crate::github::topics;
 
 /// The most commits one `history` selection will walk. GitHub's own page cap
 /// is 100 and the only call site in the contract asks for one.
 const MAX_HISTORY: usize = 100;
 /// The most repositories one page of `repositories`/`search` answers.
 const MAX_REPOS: usize = 100;
+/// GitHub's cap on a repository's topics, so one page always holds them all.
+const MAX_TOPICS: usize = 20;
 /// A blob above this is returned with `text: null`, the way GitHub truncates.
 const MAX_BLOB_TEXT: u64 = 4 << 20;
 
@@ -170,6 +173,55 @@ pub fn repository_node(
     })
 }
 
+/// `repositoryTopics(first:, after:)`: GitHub's `RepositoryTopicConnection`,
+/// one page of the stored list in its stored order.
+fn repository_topics(urls: &Urls, topics: &[String], f: &Field) -> Value {
+    let first = f
+        .usize_arg("first")
+        .unwrap_or(MAX_TOPICS)
+        .clamp(1, MAX_TOPICS);
+    let start = decode_cursor(f.str_arg("after"));
+    let nodes: Vec<Value> = topics
+        .iter()
+        .skip(start)
+        .take(first)
+        .map(|name| {
+            json!({
+                "id": node_id("RepositoryTopic", name),
+                "url": format!("{}/topics/{name}", urls.html),
+                "topic": { "id": node_id("Topic", name), "name": name },
+            })
+        })
+        .collect();
+    let next = start + nodes.len();
+    json!({
+        "totalCount": topics.len(),
+        "pageInfo": page_info(next, topics.len(), start),
+        "nodes": nodes,
+    })
+}
+
+/// Put `repositoryTopics` on a repository node when the document selects it.
+/// Topics cost a GET per repository, so an unselected field loads nothing.
+async fn with_topics(
+    ctx: &Ctx,
+    id: &RepoId,
+    node: &mut Value,
+    selection: &Field,
+) -> Result<(), GqlError> {
+    let Some(f) = selection.child("repositoryTopics") else {
+        return Ok(());
+    };
+    let topics = topics::load(&ctx.st, id).await?;
+    if let Some(obj) = node.as_object_mut() {
+        obj.insert(
+            "repositoryTopics".to_string(),
+            repository_topics(&ctx.urls, &topics, f),
+        );
+    }
+    Ok(())
+}
+
 // ---- cursors -----------------------------------------------------------------
 
 /// An opaque cursor is an offset. GitHub's are opaque too and no client in the
@@ -246,6 +298,7 @@ async fn repository(ctx: &Ctx, f: &Field, label: &str) -> Result<Value, GqlError
                 | "defaultBranchRef"
                 | "pushedAt"
                 | "updatedAt"
+                | "repositoryTopics"
         ) {
             return Err(GqlError::not_implemented(format!(
                 "{label}.repository.{}",
@@ -266,6 +319,7 @@ async fn repository(ctx: &Ctx, f: &Field, label: &str) -> Result<Value, GqlError
         .unwrap_or("main")
         .to_string();
     let mut node = repository_node(&ctx.urls, &id, &default_branch, &pushed_at(&view));
+    with_topics(ctx, &id, &mut node, f).await?;
     for child in &f.children {
         let value = match child.name.as_str() {
             "ref" => ref_field(ctx, &view, child).await?,
@@ -558,12 +612,13 @@ async fn repository_owner(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
         let first = child.usize_arg("first").unwrap_or(100).clamp(1, MAX_REPOS);
         let start = decode_cursor(child.str_arg("after"));
         let total = repos.len();
-        let nodes: Vec<Value> = repos
-            .iter()
-            .skip(start)
-            .take(first)
-            .map(|(id, branch, pushed)| repository_node(&ctx.urls, id, branch, pushed))
-            .collect();
+        let selection = child.child("nodes").cloned().unwrap_or_default();
+        let mut nodes = Vec::new();
+        for (id, branch, pushed) in repos.iter().skip(start).take(first) {
+            let mut node = repository_node(&ctx.urls, id, branch, pushed);
+            with_topics(ctx, id, &mut node, &selection).await?;
+            nodes.push(node);
+        }
         let next = start + nodes.len();
         if let Some(obj) = node.as_object_mut() {
             obj.insert(
@@ -581,27 +636,21 @@ async fn repository_owner(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
 
 /// `search(query:, type: REPOSITORY, first:)`. The query is GitHub's search
 /// syntax; the facade reads the qualifiers the client actually sends —
-/// `user:`/`org:`/`owner:` picks the owner, `in:name` and `fork:` are
-/// accepted and ignored (every repository here is a non-fork) — and matches
-/// the free terms against the name, case-insensitively.
+/// `user:`/`org:`/`owner:` picks the owner, `in:` picks what the free terms
+/// match (the name when absent; `in:topics` the topics; `description` and
+/// `readme` are never set here, so they match nothing), `topic:` keeps only
+/// repositories carrying that topic, and `fork:`/`is:`/`archived:`/`sort:`
+/// are accepted and ignored (every repository here is a live non-fork). Terms
+/// match case-insensitively as substrings, so a half-typed word still finds.
 async fn search(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
     if let Some(kind) = f.arg("type").and_then(Value::as_str)
         && kind != "REPOSITORY"
     {
         return Err(GqlError::not_implemented(format!("search(type: {kind})")));
     }
-    let q = f.str_arg("query").unwrap_or_default();
-    let mut owner = None;
-    let mut terms = Vec::new();
-    for token in q.split_whitespace() {
-        match token.split_once(':') {
-            Some(("user" | "org" | "owner", who)) => owner = Some(who.to_string()),
-            Some(("in" | "fork" | "is" | "archived" | "sort", _)) => {}
-            _ => terms.push(token.to_lowercase()),
-        }
-    }
+    let query = SearchQuery::parse(f.str_arg("query").unwrap_or_default());
     let first = f.usize_arg("first").unwrap_or(50).clamp(1, MAX_REPOS);
-    let candidates = if let Some(o) = &owner {
+    let candidates = if let Some(o) = &query.owner {
         repositories_of(ctx, o).await?
     } else {
         let ids = ctx
@@ -620,19 +669,25 @@ async fn search(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
             })
             .collect()
     };
-    let matched: Vec<&(RepoId, String, String)> = candidates
-        .iter()
-        .filter(|(id, _, _)| {
-            let name = id.name().to_lowercase();
-            terms.iter().all(|t| name.contains(t.as_str()))
-        })
-        .collect();
+    let mut matched = Vec::new();
+    for (id, branch, pushed) in &candidates {
+        let topics = if query.needs_topics() {
+            topics::load(&ctx.st, id).await?
+        } else {
+            Vec::new()
+        };
+        if query.matches(id.name(), &topics) {
+            matched.push((id, branch, pushed));
+        }
+    }
     let total = matched.len();
-    let nodes: Vec<Value> = matched
-        .iter()
-        .take(first)
-        .map(|(id, branch, pushed)| repository_node(&ctx.urls, id, branch, pushed))
-        .collect();
+    let selection = f.child("nodes").cloned().unwrap_or_default();
+    let mut nodes = Vec::new();
+    for (id, branch, pushed) in matched.into_iter().take(first) {
+        let mut node = repository_node(&ctx.urls, id, branch, pushed);
+        with_topics(ctx, id, &mut node, &selection).await?;
+        nodes.push(node);
+    }
     let next = nodes.len();
     Ok(json!({
         "repositoryCount": total,
@@ -641,9 +696,66 @@ async fn search(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
     }))
 }
 
+/// A repository search string, split into the parts the facade answers.
+#[derive(Debug, Default)]
+struct SearchQuery {
+    owner: Option<String>,
+    /// Lowercased free terms; every one must match.
+    terms: Vec<String>,
+    /// The `in:` fields, lowercased. Empty means the name.
+    fields: Vec<String>,
+    /// `topic:` qualifiers, lowercased; every one must be a topic.
+    topics: Vec<String>,
+}
+
+impl SearchQuery {
+    fn parse(q: &str) -> Self {
+        let mut out = SearchQuery::default();
+        for token in q.split_whitespace() {
+            match token.split_once(':') {
+                Some(("user" | "org" | "owner", who)) => out.owner = Some(who.to_string()),
+                Some(("in", fields)) => out.fields.extend(fields.split(',').map(str::to_lowercase)),
+                Some(("topic", topic)) => out.topics.push(topic.to_lowercase()),
+                Some(("fork" | "is" | "archived" | "sort", _)) => {}
+                _ => out.terms.push(token.to_lowercase()),
+            }
+        }
+        out
+    }
+
+    fn searches_topics(&self) -> bool {
+        self.fields.iter().any(|f| f == "topics")
+    }
+
+    fn searches_name(&self) -> bool {
+        self.fields.is_empty() || self.fields.iter().any(|f| f == "name")
+    }
+
+    fn needs_topics(&self) -> bool {
+        self.searches_topics() || !self.topics.is_empty()
+    }
+
+    fn term_matches(&self, term: &str, name: &str, topics: &[String]) -> bool {
+        let in_name = self.searches_name() && name.to_lowercase().contains(term);
+        let in_topics = self.searches_topics() && topics.iter().any(|t| t.contains(term));
+        in_name || in_topics
+    }
+
+    fn matches(&self, name: &str, topics: &[String]) -> bool {
+        let has_every_topic = self.topics.iter().all(|want| topics.contains(want));
+        let every_term_matches = self
+            .terms
+            .iter()
+            .all(|term| self.term_matches(term, name, topics));
+        has_every_topic && every_term_matches
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{abbreviated, decode_cursor, encode_cursor, headline_and_body, split_ref};
+    use super::{
+        SearchQuery, abbreviated, decode_cursor, encode_cursor, headline_and_body, split_ref,
+    };
 
     #[test]
     fn a_message_splits_into_headline_and_body() {
@@ -678,5 +790,34 @@ mod tests {
     fn oids_abbreviate_without_slicing_a_short_one() {
         assert_eq!(abbreviated("0123456789abcdef"), "0123456");
         assert_eq!(abbreviated("abc"), "abc");
+    }
+
+    #[test]
+    fn search_terms_match_the_name_unless_in_says_otherwise() {
+        let topics = vec!["docs".to_string(), "public-api".to_string()];
+        let plain = SearchQuery::parse("doc user:acme fork:true");
+        assert_eq!(plain.owner.as_deref(), Some("acme"));
+        assert!(!plain.needs_topics());
+        assert!(plain.matches("docs-site", &[]));
+        assert!(!plain.matches("website", &topics));
+
+        let in_topics = SearchQuery::parse("pub in:topics user:acme");
+        assert!(in_topics.needs_topics());
+        assert!(in_topics.matches("website", &topics));
+        assert!(!in_topics.matches("public", &[]));
+
+        let both = SearchQuery::parse("site in:name,topics");
+        assert!(both.matches("website", &[]));
+        assert!(SearchQuery::parse("api in:name,topics").matches("website", &topics));
+    }
+
+    #[test]
+    fn a_topic_qualifier_keeps_only_repositories_carrying_it() {
+        let topics = vec!["docs".to_string()];
+        let q = SearchQuery::parse("topic:Docs");
+        assert!(q.needs_topics());
+        assert!(q.matches("anything", &topics));
+        assert!(!q.matches("anything", &[]));
+        assert!(!SearchQuery::parse("topic:doc").matches("anything", &topics));
     }
 }
