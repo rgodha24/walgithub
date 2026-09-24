@@ -69,6 +69,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/v3/repos/{owner}/{repo}", get(repo::get_repo))
         .route(
+            "/api/v3/repos/{owner}/{repo}/topics",
+            get(super::topics::get_topics).put(super::topics::replace_topics),
+        )
+        .route(
             "/api/v3/repos/{owner}/{repo}/collaborators/{username}/permission",
             get(auth::collaborator_permission),
         )

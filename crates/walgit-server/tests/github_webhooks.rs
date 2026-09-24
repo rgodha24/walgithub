@@ -777,3 +777,58 @@ async fn integration_identity_redaction_validation_and_last_installation_delete(
     assert!(!response.text().await?.contains(SECRET));
     Ok(())
 }
+
+/// A consumer that routes a merged PR by repository topic reads them off the
+/// `pull_request` payload's `repository`, so every delivery carries the list
+/// `PUT /topics` stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deliveries_carry_the_repository_topics() -> TestResult {
+    let (url, captured) = receiver().await;
+    let s = server(&url).await?;
+    let (_tmp, dir) = fixture(&s)?;
+    let client = reqwest::Client::new();
+
+    commit_in(&dir, "docs.json", "{}\n", "initial commit")?;
+    git_in(&dir, &["push", "-q", "origin", "main"])?;
+    let resp = client
+        .put(api(&s, "/repos/acme/docs/topics"))
+        .json(&serde_json::json!({ "names": ["docs", "public-api"] }))
+        .send()
+        .await?;
+    anyhow::ensure!(resp.status().is_success(), "put topics: {}", resp.status());
+
+    git_in(&dir, &["checkout", "-q", "-b", "editor/topics"])?;
+    commit_in(&dir, "docs/topics.mdx", "hello\n", "docs: add a page")?;
+    git_in(&dir, &["push", "-q", "origin", "editor/topics"])?;
+    let (d, _) = wait_for(&captured, "push", |p| {
+        p["ref"] == "refs/heads/editor/topics"
+    })
+    .await;
+    assert_eq!(
+        d.payload["repository"]["topics"],
+        serde_json::json!(["docs", "public-api"])
+    );
+
+    let resp = client
+        .post(api(&s, "/repos/acme/docs/pulls"))
+        .json(&serde_json::json!({ "title": "Topics", "head": "editor/topics", "base": "main" }))
+        .send()
+        .await?;
+    let pr: Value = resp.json().await?;
+    let number = pr["number"].as_u64().unwrap_or_default();
+    anyhow::ensure!(number > 0, "no PR number: {pr}");
+    let resp = client
+        .put(api(&s, &format!("/repos/acme/docs/pulls/{number}/merge")))
+        .json(&serde_json::json!({ "merge_method": "merge" }))
+        .send()
+        .await?;
+    anyhow::ensure!(resp.status().is_success(), "merge: {}", resp.status());
+
+    let (d, _) = wait_for(&captured, "pull_request", |p| p["action"] == "closed").await;
+    assert_eq!(d.payload["pull_request"]["merged"], true);
+    assert_eq!(
+        d.payload["repository"]["topics"],
+        serde_json::json!(["docs", "public-api"])
+    );
+    Ok(())
+}

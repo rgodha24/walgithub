@@ -94,6 +94,13 @@ impl Sender {
     }
 }
 
+/// Set `topics` on a rendered `repository` object; anything else is left alone.
+fn with_topics(repository: &mut Value, topics: &[String]) {
+    if let Some(obj) = repository.as_object_mut() {
+        obj.insert("topics".to_string(), json!(topics));
+    }
+}
+
 /// Fire one `pull_request` (or any handler-side) delivery in the background.
 /// Never awaited by a request handler: a slow consumer must not slow a write.
 pub fn spawn(st: &Arc<AppState>, event: &'static str, payload: Value) {
@@ -105,6 +112,19 @@ pub fn spawn(st: &Arc<AppState>, event: &'static str, payload: Value) {
         let Ok(id) = full_name.parse::<RepoId>() else {
             return;
         };
+        // GitHub's `repository` carries the topics, and a consumer that routes
+        // a merged PR by topic reads them off this payload.
+        let mut payload = payload;
+        if let Ok(topics) = super::topics::load(&st, &id).await
+            && let Some(repository) = payload.get_mut("repository")
+        {
+            with_topics(repository, &topics);
+        } else {
+            tracing::warn!(
+                event,
+                "could not load repository topics for a GitHub webhook"
+            );
+        }
         let registry = match super::integrations::read(st.registry.store()).await {
             Ok(r) => r,
             Err(_) => {
@@ -275,8 +295,15 @@ impl GithubSink {
             .ok_or_else(|| anyhow::anyhow!("github webhook sink has no server state attached"))
     }
 
-    async fn deliver_ref(&self, view: &View, urls: &Urls, ev: &RefEvent) -> anyhow::Result<()> {
-        let repository = super::prs::repo_json(view, urls);
+    async fn deliver_ref(
+        &self,
+        view: &View,
+        topics: &[String],
+        urls: &Urls,
+        ev: &RefEvent,
+    ) -> anyhow::Result<()> {
+        let mut repository = super::prs::repo_json(view, urls);
+        with_topics(&mut repository, topics);
 
         let created = all_zeros(&ev.old);
         let deleted = all_zeros(&ev.new);
@@ -436,9 +463,10 @@ impl Sink for GithubSink {
         // A bridge batch is already committed before we synchronize. One view
         // per repo therefore contains the objects for every event in the batch;
         // repeatedly syncing it per event only queues behind concurrent writers.
+        // The repository's topics ride along: one GET per repo, not per event.
         let mut views = std::collections::HashMap::new();
         for ev in batch.iter().filter(|ev| !ev.ref_type.is_empty()) {
-            let view = match views.entry(ev.repo.as_str()) {
+            let (view, topics) = match views.entry(ev.repo.as_str()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let (owner, name) = ev
@@ -449,10 +477,13 @@ impl Sink for GithubSink {
                     let view = repo::objects_view(&st, &id)
                         .await
                         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-                    entry.insert(view)
+                    let topics = super::topics::load(&st, &id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                    entry.insert((view, topics))
                 }
             };
-            self.deliver_ref(view, &urls, ev).await?;
+            self.deliver_ref(view, topics, &urls, ev).await?;
         }
         Ok(())
     }

@@ -2,20 +2,20 @@
 //!
 //! **There is no GraphQL engine here, on purpose.** Every document the client
 //! sends is a string literal in its own source — `docs/GITHUB_SHAPES.md`
-//! ("POST /graphql") lists all eleven of them, their variables and the exact
+//! ("POST /graphql") lists all thirteen of them, their variables and the exact
 //! fields destructured off the response — so the facade parses the document
 //! with `graphql-parser`, takes its single operation, resolves the arguments
 //! against the JSON `variables`, and dispatches on field names. A schema, a
 //! resolver graph and an executor would be a large amount of machinery to
-//! answer eleven known questions.
+//! answer thirteen known questions.
 //!
 //! Shape of the answers:
 //!
 //! - Each arm returns the **full** documented shape of its node, not only the
 //!   fields the document selected. The documents are literals that get edited;
 //!   a response that carries only today's selection breaks on the next edit.
-//!   Selection still decides *work* (`history` and `blame` are computed only
-//!   when asked for).
+//!   Selection still decides *work* (`history`, `blame` and `repositoryTopics`
+//!   are computed only when asked for).
 //! - A field the facade does not serve is
 //!   `{"data":null,"errors":[{"type":"NOT_IMPLEMENTED","message":"not
 //!   implemented: <op>.<field>"}]}` with **HTTP 200** — GitHub answers every
