@@ -1,9 +1,8 @@
 //! `POST /api/graphql` and `POST /api/v3/graphql`.
 //!
 //! **There is no GraphQL engine here, on purpose.** Every document the client
-//! sends is a string literal in its own source — `docs/GITHUB_SHAPES.md`
-//! ("POST /graphql") lists all thirteen of them, their variables and the exact
-//! fields destructured off the response — so the facade parses the document
+//! sends is a string literal in its own source — thirteen of them, each with fixed variables
+//! and a fixed set of fields destructured off the response — so the facade parses the document
 //! with `graphql-parser`, takes its single operation, resolves the arguments
 //! against the JSON `variables`, and dispatches on field names. A schema, a
 //! resolver graph and an executor would be a large amount of machinery to

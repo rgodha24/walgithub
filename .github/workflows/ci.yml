@@ -130,17 +130,6 @@ jobs:
           provenance: false
           build-args: WALGIT_BUILD_SHA=${{ github.sha }}
           tags: walgithub:smoke
-      - name: Export walgit-server for tesser boxes
-        run: |
-          id=$(docker create walgithub:smoke)
-          docker cp "$id:/usr/local/bin/walgit-server" walgit-server
-          docker rm "$id" > /dev/null
-          strip walgit-server
-      - uses: actions/upload-artifact@v4
-        with:
-          name: walgit-server-linux-x86_64-${{ github.event.pull_request.head.sha || github.sha }}
-          path: walgit-server
-          retention-days: 90
       - name: Start S3-compatible test store
         run: |
           docker compose up -d --wait rustfs

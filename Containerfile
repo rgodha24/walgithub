@@ -1,4 +1,4 @@
-# walgithub image — private GitHub facade for editor E2Es.
+# walgithub image — the GitHub Enterprise Server facade for local development and E2Es.
 #
 #   podman build -t walgit -f Containerfile .
 #   podman run --rm -p 127.0.0.1:8097:8097 \

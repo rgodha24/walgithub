@@ -1,7 +1,7 @@
 //! `blame(path:)` on a commit, out of `git blame --porcelain`.
 //!
-//! Two documents in the contract select it (`docs/GITHUB_SHAPES.md`,
-//! `BlameAuthors` and `Blame`): one reads
+//! Two documents the Mintlify server sends select it
+//! (`BlameAuthors` and `Blame`): one reads
 //! `ranges[].commit.author.user.email ?? .author.email`, the other reads
 //! `ranges[].commit.committedDate` and *rethrows* on failure, so this must
 //! answer a real date that `new Date(...)` parses.

@@ -1,5 +1,5 @@
 //! `POST /api/graphql` (`docs/GITHUB.md` §GraphQL): every document the
-//! Mintlify server sends, verbatim from `docs/GITHUB_SHAPES.md`, against a
+//! Mintlify server sends, verbatim, against a
 //! repository pushed with real `git` — including the write path, which is
 //! verified by fetching the commit back with `git`.
 
@@ -29,7 +29,7 @@ async fn gql(s: &Server, query: &str, variables: Value) -> anyhow::Result<Value>
     let status = resp.status();
     anyhow::ensure!(status == reqwest::StatusCode::OK, "graphql -> {status}");
     // The rate-limit budget a client reads off every response; zero would make
-    // it sleep for a minute before retrying (`docs/GITHUB_SHAPES.md`).
+    // it sleep for a minute before retrying.
     let remaining = resp
         .headers()
         .get("x-ratelimit-remaining")
@@ -80,7 +80,7 @@ fn fixture(s: &Server, owner: &str, name: &str) -> anyhow::Result<(tempfile::Tem
     Ok((tmp, head))
 }
 
-// The documents, copied out of `docs/GITHUB_SHAPES.md` without an edit.
+// The documents, copied out of the Mintlify server without an edit.
 
 const GET_LATEST_COMMIT: &str = "query getLatestCommit($owner: String!, $name: String!, $branch: String!) {
   repository(name: $name, owner: $owner) {

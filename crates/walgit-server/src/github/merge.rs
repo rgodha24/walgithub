@@ -30,7 +30,7 @@ use super::write::Scratch;
 use crate::AppState;
 
 /// GitHub answers an unmergeable PR with 405, not 409 — the Mintlify server
-/// branches on exactly that status (`docs/GITHUB_SHAPES.md`, Tier 3).
+/// branches on exactly that status.
 pub const NOT_MERGEABLE: &str = "Pull Request is not mergeable";
 /// The 409 a client retries after re-reading the head.
 pub const HEAD_MODIFIED: &str = "Head branch was modified. Review and try the merge again.";

@@ -1,6 +1,5 @@
-//! `GET /repos/{o}/{r}/contents/{path}` — the hottest read the facade serves
-//! (1.58M/7d in `docs/GITHUB_SHAPES.md`), and the one with the most
-//! representations.
+//! `GET /repos/{o}/{r}/contents/{path}` — the hottest read the facade serves,
+//! and the one with the most representations.
 //!
 //! One route answers four shapes, chosen by the path's object type and the
 //! `Accept` header:

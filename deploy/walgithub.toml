@@ -1,5 +1,6 @@
-# Runtime defaults for the private editor E2E facade image.
-# ECS supplies the bucket, region, private origin. Integrations are registered through the private _dev API.
+# Runtime defaults for the facade image (Containerfile).
+# The deployment supplies the bucket, region and public origin (WALGIT__ overrides). Integrations are
+# registered through the `_dev` API (docs/GITHUB.md §11).
 [server]
 listen = "0.0.0.0:8097"
 auto_create_on_push = true

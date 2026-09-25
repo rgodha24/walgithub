@@ -239,8 +239,8 @@ async fn set_draft(ctx: &Ctx, f: &Field, draft: bool) -> Result<Value, GqlError>
 
 /// `addPullRequestReviewThread(input:)`. The client addresses it by
 /// `pullRequestReviewId` — the `node_id` of the pending review it just opened
-/// over REST — and reads back `thread.id`, throwing when it is null
-/// (`docs/GITHUB_SHAPES.md` §9). `pullRequestId` is accepted too, since the
+/// over REST — and reads back `thread.id`, throwing when it is null.
+/// `pullRequestId` is accepted too, since the
 /// same mutation takes either on GitHub.
 async fn add_review_thread(ctx: &Ctx, f: &Field) -> Result<Value, GqlError> {
     let input = f.input();

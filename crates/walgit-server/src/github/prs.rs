@@ -335,7 +335,7 @@ fn pr_json(
     body
 }
 
-/// A `pull_request` webhook body (`docs/GITHUB_SHAPES.md` Tier 5): the same PR
+/// A `pull_request` webhook body: the same PR
 /// object every read renders, plus the repository, the installation and the
 /// sender. One definition, so a handler and the WAL-driven `synchronize` agree.
 #[allow(clippy::too_many_arguments)]
@@ -1177,7 +1177,7 @@ fn review_state(event: Option<&str>) -> &'static str {
         Some("REQUEST_CHANGES") => "CHANGES_REQUESTED",
         Some("COMMENT") => "COMMENTED",
         // A body-less POST creates a *pending* review whose node id is fed to
-        // the GraphQL thread mutation (`docs/GITHUB_SHAPES.md`, Tier 3).
+        // the GraphQL thread mutation.
         _ => "PENDING",
     }
 }

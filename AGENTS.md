@@ -40,7 +40,6 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `walgit.example.toml` | Every config key with its default and a comment. Change it with the code. |
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
-| `docs/RELEASING.md` | Publishing the private editor E2E facade image and selecting its ECS digest. |
 | `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
 
 ---
@@ -449,13 +448,9 @@ Decision identifiers are stable; gaps in the numbering are intentional.
 neither configured static-key variable is set. This supports refreshing ECS task roles without storing
 long-lived access keys. Explicit pairs still support local object stores; partial pairs fail closed.
 
-**D44 — Facade release images (2026-09-09).** The private walgithub repository builds images on published
-GitHub releases. Release tags select commits already on main; AWS OIDC grants access only to the dev ECR
-repository. Infrastructure selects the resulting digest separately. See `docs/RELEASING.md`.
-
 **D45 — Facade runtime configuration (2026-09-09).** The walgithub image packages
-`deploy/walgithub.toml`; facade behavior changes ship with its release. Pulumi supplies only
-AWS resource bindings (bucket, region, private origin, and injected webhook secret).
+`deploy/walgithub.toml`; facade behavior changes ship with the image. The deployment supplies only
+the store bindings (bucket, region, public origin) and secrets through `WALGIT__` overrides.
 
 **D46 — Dynamic GitHub App integrations (2026-09-09).** Replaces D42's global GitHub callback/secret/
 installation config with `github/integrations.json`, a CAS'd bucket registry managed by the private

@@ -127,8 +127,7 @@ pub fn wants_object(headers: &HeaderMap) -> bool {
 }
 
 /// The bytes of a blob, with `Content-Type: application/vnd.github.raw`. The
-/// bypass client destroys the stream unless the content type starts with that
-/// (`docs/GITHUB_SHAPES.md`).
+/// bypass client destroys the stream unless the content type starts with that.
 pub fn raw_response(bytes: Vec<u8>) -> Response {
     (
         [(
@@ -638,9 +637,8 @@ async fn branch_protection(
 /// `GET /api/v3/repos/{o}/{r}/branches/{branch}`.
 ///
 /// This replaces `repo::get_branch` for one reason: `protected` short-circuits
-/// `getBranchProtections` to all-false without ever calling the rules endpoint
-/// (`docs/GITHUB_SHAPES.md`), so a hardcoded `false` there would make the
-/// toggle above unobservable.
+/// `getBranchProtections` to all-false without ever calling the rules endpoint,
+/// so a hardcoded `false` there would make the toggle above unobservable.
 pub async fn get_branch(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,

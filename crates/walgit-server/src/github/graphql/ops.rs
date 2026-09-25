@@ -36,7 +36,7 @@ pub struct Ctx {
 
 impl Ctx {
     /// GitHub's own wording for a repository that does not resolve — the
-    /// client greps the message for it (`docs/GITHUB_SHAPES.md`).
+    /// client greps the message for it.
     pub fn repo_id(&self, owner: &str, name: &str) -> Result<RepoId, GqlError> {
         RepoId::new(owner, name).map_err(|_| {
             GqlError::not_found(format!(
@@ -123,7 +123,7 @@ fn signature(urls: &Urls, name: &str, email: &str, date: &str) -> Value {
 }
 
 /// A GraphQL `Commit`. `url` is the browser URL: the client stores it as the
-/// commit's `link` (`docs/GITHUB_SHAPES.md`, `createCommitOnBranch`).
+/// commit's `link` (`createCommitOnBranch`).
 pub fn commit_node(urls: &Urls, full_name: &str, c: &CommitFacts) -> Value {
     let (headline, body) = headline_and_body(&c.message);
     let url = format!("{}/{full_name}/commit/{}", urls.html, c.sha);

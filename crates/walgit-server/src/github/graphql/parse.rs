@@ -1,9 +1,9 @@
 //! The document, reduced to the little tree [`super::ops`] dispatches on.
 //!
 //! There is no GraphQL engine here and there will not be one. Every document
-//! the client sends is a literal in its source (`docs/GITHUB_SHAPES.md`,
-//! "POST /graphql"), so the facade parses the document, resolves each
-//! argument against the JSON `variables` object, and answers on the names.
+//! the client sends is a literal in its source, so the facade parses the
+//! document, resolves each argument against the JSON `variables` object, and
+//! answers on the names.
 //! Inline fragments are flattened into their parent's children: the facade
 //! knows the concrete type of everything it returns, so `... on Commit` is
 //! only a spelling of "these fields too". Named fragment spreads are dropped —

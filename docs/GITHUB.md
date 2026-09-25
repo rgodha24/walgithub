@@ -9,7 +9,7 @@ octokit with it — needs no new code to develop against walgit: point that `bas
 `http://<walgit-host>/api/v3` and it reads real refs, commits and objects out of the bucket, and its writes
 go through walgit's publish path.
 
-It serves local development and private editor E2Es. There are no rate limits and no authentication;
+It serves local development and editor E2Es. There are no rate limits and no authentication;
 the private network is the trust boundary. Its app integrations and signed callbacks are registered in
 the facade rather than at github.com.
 
@@ -395,8 +395,7 @@ merge-tree and the publish is a conflict rather than a lost update.
 ## 10. GraphQL
 
 `POST /api/graphql` and `POST /api/v3/graphql` are one handler, and there is **no GraphQL engine behind
-it**. Every document a client sends is a string literal in its own source — `docs/GITHUB_SHAPES.md`
-("POST /graphql") lists all of them, their variables and the exact fields destructured off the answer — so
+it**. Every document a client sends is a string literal in its own source, with fixed variables and a fixed set of fields destructured off the answer — so
 the handler parses the document with `graphql-parser`, takes its single operation, resolves each argument
 against the JSON `variables`, and dispatches on field names. A schema, a resolver graph and an executor
 would be a large amount of machinery to answer thirteen known questions.
@@ -455,8 +454,8 @@ end to end.
 `crates/walgit-server/tests/github.rs` boots a server on the in-memory store, pushes a real repository with
 real `git`, then exercises the auth stubs, the OAuth flow, every read shape, ref create/update/delete, a
 write through `github::write` verified by a real `git fetch`, and the two fail-closed paths (facade absent
-when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document in
-`docs/GITHUB_SHAPES.md` §GraphQL verbatim against a pushed repository — including `createCommitOnBranch`,
+when disabled, `validate` refusing a public bind). `tests/github_graphql.rs` runs every document the
+Mintlify server sends, verbatim, against a pushed repository — including `createCommitOnBranch`,
 whose commit is fetched back with `git` and read out of the tree. Both are in `just test`.
 
 `scripts/github-smoke.mjs` is the client-side check: the real `octokit` package (App JWT →
@@ -469,7 +468,7 @@ on and merged, `commits/{sha}/pulls`, and a check-run created then patched.
 ## 11. Webhooks
 
 The facade delivers GitHub-shaped webhooks so a GitHub App backend deploys on a `git push` the way it does
-against real GHES. `docs/GITHUB_SHAPES.md` §"Tier 5 — Webhooks" is the contract; this is how it is produced.
+against real GHES. This is how they are produced.
 
 ### 11.1 Integrations and registration
 

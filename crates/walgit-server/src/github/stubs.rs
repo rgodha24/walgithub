@@ -1,4 +1,4 @@
-//! Accept-and-forget endpoints (`docs/GITHUB_SHAPES.md`, Tier 4).
+//! Accept-and-forget endpoints.
 //!
 //! Check runs, deployments and commit statuses exist so a client's happy path
 //! does not fault. Nothing here is durable: state lives in a bounded

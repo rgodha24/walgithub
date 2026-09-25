@@ -2,7 +2,7 @@
 //!
 //! `githubApiClient.ts` turns any `200` whose body has a non-empty `errors[]`
 //! into a `GraphqlResponseError` and reads exactly two fields of the first
-//! entry: `type` and `message` (`docs/GITHUB_SHAPES.md`, "POST /graphql").
+//! entry: `type` and `message`.
 //! `createCommitOnBranch` then branches on the `type`, so the strings here are
 //! GitHub's, not ours — `NOT_FOUND`, `UNPROCESSABLE`, `STALE_DATA`,
 //! `FORBIDDEN`. `path` and `locations` are present because octokit's types say

@@ -1,7 +1,7 @@
 //! `GET /repos/{o}/{r}/compare/{base}...{head}` — 457k calls/7d, and the one
 //! read whose absence is a hard error rather than a degraded answer: a missing
 //! `files` on the diff path throws before anything else can run
-//! (`docs/GITHUB_SHAPES.md`).
+//! in the Mintlify server.
 //!
 //! GitHub's compare is three-dot: everything is measured from the **merge
 //! base**, not from `base` itself. `ahead_by`/`behind_by`, `commits[]` and
