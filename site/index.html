@@ -137,7 +137,7 @@ open https://walgit.localhost:8080/</code></pre>
       <h3>Get it</h3>
 <pre><code>nix run github:tobi/walgit -- --config walgit.toml
 <span class="c"># or</span>
-podman build -t walgit -f Containerfile . &amp;&amp; podman run -p 8080:8080 walgit
+podman build -t walgit . &amp;&amp; podman run -p 8080:8080 walgit
 <span class="c"># or</span>
 cargo build --release -p walgit-cli      <span class="c"># after `just web-build`</span></code></pre>
       <p>Roles (<code>server.roles</code>): <code>serve</code>, <code>maintain</code>, <code>events</code>. Empty = all.

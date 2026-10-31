@@ -39,8 +39,9 @@ machines whose "disk" is 20 GiB of tmpfs, next to a long tail of small repositor
 | `web/README.md` | Frontend engineers changing the React SPA, Vite build, SDK adapter, static assets, loading states. |
 | `walgit.example.toml` | Every config key with its default and a comment. Change it with the code. |
 | `walgit.standalone.toml` | The one-machine shape: `walgit-server --config walgit.standalone.toml` → `https://walgit.localhost:8080/`. |
+| `docs/HOSTING.md` | Anyone running walgit as a service: the image, `deploy/compose.yaml` (WAL-Git + WAL-Github), auth/TLS, roles and placement, upgrades, monitoring. |
 | `deploy/nginx.conf.example` | An optional nginx in front; documents the `X-Accel-Redirect` byte-offload contract. |
-| `Containerfile`, `flake.nix` | An OCI image; a Nix package, image and devshell. |
+| `Dockerfile`, `deploy/compose.yaml`, `deploy/walgit.env.example`, `deploy/compose.rustfs.yaml` | The image (both services via build args); the WAL stack; its shared environment; the optional, separate rustfs dev store. `flake.nix` is the Nix package, image and devshell. |
 
 ---
 
@@ -451,6 +452,12 @@ long-lived access keys. Explicit pairs still support local object stores; partia
 **D45 — Facade runtime configuration (2026-09-09).** The walgithub image packages
 `deploy/walgithub.toml`; facade behavior changes ship with the image. The deployment supplies only
 the store bindings (bucket, region, public origin) and secrets through `WALGIT__` overrides.
+**(2026-10-31)** One `Dockerfile` builds both shapes: the default bakes `deploy/host.toml` for
+WAL-Git, while WAL-Github selects its config with
+`--build-arg WALGIT_CONFIG_FILE=deploy/walgithub.toml --build-arg WALGIT_HTTP_PORT=8097`. The WAL
+deployment (`deploy/compose.yaml`, `docs/HOSTING.md`) runs both services and deliberately starts no object
+store; `deploy/compose.rustfs.yaml` is a separate, optional dev store. The `Containerfile` name is
+gone; the build file is `Dockerfile`.
 
 **D46 — Dynamic GitHub App integrations (2026-09-09).** Replaces D42's global GitHub callback/secret/
 installation config with `github/integrations.json`, a CAS'd bucket registry managed by the private

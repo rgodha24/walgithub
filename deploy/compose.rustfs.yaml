@@ -1,12 +1,19 @@
-# compose file for walgit local dev (podman compose): rustfs (S3-compatible) + bucket creation.
+# Optional S3-compatible store for local development — a SEPARATE Compose project.
 #
-# Usage:
-#   podman compose up -d rustfs           # start rustfs
-#   podman compose run --rm create-bucket # create the walgit-test bucket
+# The WAL deployment (deploy/compose.yaml) deliberately starts no store: point it at your own
+# bucket through `.env`. This file is the one we recommend when you want a local S3 endpoint:
+#
+#   podman compose -f deploy/compose.rustfs.yaml up -d rustfs
+#   podman compose -f deploy/compose.rustfs.yaml run --rm create-bucket
 #   just dev-store                        # convenience wrapper
+#
+# Then set WALGIT__STORE__S3__ENDPOINT=http://host.docker.internal:9000 and
+# WALGIT__STORE__S3__FORCE_PATH_STYLE=true in the WAL deployment's `.env`.
 #
 # rustfs exposes the S3 API on :9000 and the console on :9001.
 # Credentials are fixed for local dev — do not use in production.
+
+name: walgit-rustfs
 
 services:
   rustfs:

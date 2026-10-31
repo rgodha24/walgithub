@@ -50,16 +50,16 @@ mode = "none"
 
 [store]
 # The one durable thing; every host pointed at it serves the same repositories.
-# This shape: rustfs (S3-compatible) in a container, started by `just dev-store` (compose.yaml;
-# bucket walgit-test, keys walgit-dev / walgit-dev-secret). Any S3 (AWS, MinIO, R2, Ceph…) is the
-# same: set endpoint/region, point the key envs at your credentials.
+# This shape: rustfs (S3-compatible) in a container, started by `just dev-store`
+# (deploy/compose.rustfs.yaml; bucket walgit-test, keys walgit-dev / walgit-dev-secret). Any S3
+# (AWS, MinIO, R2, Ceph…) is the same: set endpoint/region, point the key envs at your credentials.
 backend = "s3"
 bucket = "walgit-test"
 prefix = ""
 [store.s3]
 endpoint = "http://127.0.0.1:9000"
 region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"       # compose.yaml fixes walgit-dev / walgit-dev-secret for rustfs
+access_key_env = "AWS_ACCESS_KEY_ID"       # deploy/compose.rustfs.yaml fixes walgit-dev / walgit-dev-secret for rustfs
 secret_key_env = "AWS_SECRET_ACCESS_KEY"
 force_path_style = true
 # A GCS bucket instead (Application Default Credentials):
