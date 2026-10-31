@@ -1,0 +1,87 @@
+# WAL deployment: WAL-Git and WAL-Github in front of an object store you provide.
+#
+#   cp deploy/walgit.env.example deploy/.env && "${EDITOR:-vi}" deploy/.env
+#   docker compose -f deploy/compose.yaml up -d --build
+#
+# There is deliberately no S3 backend here. Both services read WALGIT__STORE__* from `.env`,
+# so the bucket is your decision. An optional local rustfs dev store lives in
+# deploy/compose.rustfs.yaml and is a separate Compose project (docs/HOSTING.md).
+#
+#   WAL-Git     http://127.0.0.1:8080   token auth; serve + maintain
+#   WAL-Github  http://127.0.0.1:8097   GHES facade; auth-free, loopback only; serve + events
+#
+# The bucket is the repository. Both cache volumes are disposable.
+
+name: walgit
+
+x-walgit-common: &walgit-common
+  restart: unless-stopped
+  # SIGTERM starts the serving drain (D31): phase 1 is bounded at 30s and phase 2 gets
+  # server.drain_timeout (20s), so Docker must not SIGKILL before both finish.
+  stop_grace_period: 60s
+  env_file:
+    - .env
+  # The image's root filesystem is only the OS, git and the binaries; the process never writes
+  # to it. /tmp is scratch; the cache volume is the one writable mount that holds state.
+  read_only: true
+  tmpfs:
+    - /tmp:rw,size=256m
+  # Reach an object store published on the host (optional; Docker Desktop resolves it anyway).
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  walgit:
+    <<: *walgit-common
+    image: ${WALGIT_IMAGE:-walgit:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        WALGIT_CONFIG_FILE: deploy/host.toml
+        WALGIT_HTTP_PORT: "8080"
+        WALGIT_BUILD_SHA: ${WALGIT_BUILD_SHA:-dev}
+    environment:
+      # Fail fast instead of creating objects in a bucket nobody named.
+      WALGIT__STORE__BUCKET: "${WALGIT__STORE__BUCKET:?set WALGIT__STORE__BUCKET in .env}"
+      WALGIT_TOKEN: "${WALGIT_TOKEN:?set WALGIT_TOKEN in .env}"
+      WALGIT__SERVER__AUTH__MODE: "${WALGIT_AUTH_MODE:-token}"
+      WALGIT__SERVER__ROLES: '["serve","maintain"]'
+      WALGIT__SERVER__LISTEN: "${WALGIT_LISTEN:-0.0.0.0:8080}"
+      WALGIT__SERVER__PUBLIC_URL: "${WALGIT_PUBLIC_URL:-http://127.0.0.1:8080}"
+    ports:
+      - "${WALGIT_BIND:-127.0.0.1}:${WALGIT_PORT:-8080}:${WALGIT_CONTAINER_PORT:-8080}"
+    volumes:
+      - walgit-cache:/var/lib/walgit
+
+  walgithub:
+    <<: *walgit-common
+    image: ${WALGITHUB_IMAGE:-walgithub:latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        WALGIT_CONFIG_FILE: deploy/walgithub.toml
+        WALGIT_HTTP_PORT: "8097"
+        WALGIT_BUILD_SHA: ${WALGIT_BUILD_SHA:-dev}
+    environment:
+      WALGIT__STORE__BUCKET: "${WALGIT__STORE__BUCKET:?set WALGIT__STORE__BUCKET in .env}"
+      # The facade is auth-free by construction (docs/GITHUB.md) and must stay that way.
+      WALGIT__SERVER__AUTH__MODE: "none"
+      WALGIT__SERVER__TLS__MODE: "off"
+      WALGIT__SERVER__ROLES: '["serve","events"]'
+      WALGIT__SERVER__LISTEN: "${WALGITHUB_LISTEN:-0.0.0.0:8097}"
+      WALGIT__SERVER__PUBLIC_URL: "${WALGITHUB_PUBLIC_URL:-http://127.0.0.1:8097}"
+    ports:
+      - "${WALGITHUB_BIND:-127.0.0.1}:${WALGITHUB_PORT:-8097}:${WALGITHUB_CONTAINER_PORT:-8097}"
+    volumes:
+      - walgithub-cache:/var/lib/walgit
+
+volumes:
+  walgit-cache:
+  walgithub-cache:

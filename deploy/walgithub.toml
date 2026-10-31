@@ -1,6 +1,8 @@
-# Runtime defaults for the facade image (Containerfile).
-# The deployment supplies the bucket, region and public origin (WALGIT__ overrides). Integrations are
-# registered through the `_dev` API (docs/GITHUB.md §11).
+# Runtime defaults for WAL-Github: the Dockerfile with
+#   --build-arg WALGIT_CONFIG_FILE=deploy/walgithub.toml --build-arg WALGIT_HTTP_PORT=8097
+# (deploy/compose.yaml's `walgithub` service does this). The deployment supplies the bucket, region and
+# public origin (WALGIT__ overrides). Integrations are registered through the `_dev` API
+# (docs/GITHUB.md §11).
 [server]
 listen = "0.0.0.0:8097"
 auto_create_on_push = true

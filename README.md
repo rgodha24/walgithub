@@ -117,7 +117,7 @@ with its reasoning, the invariants, and the cost model (round trips to the bucke
 ```sh
 # build (needs rust per rust-toolchain.toml, protoc, node 24 + pnpm for the web UI)
 just web-build && cargo build --release -p walgit-cli
-# or: nix build .#walgit        or: podman build -t walgit -f Containerfile .
+# or: nix build .#walgit        or: docker build -t walgit .
 
 # one box, TLS by walgit itself, a local S3 store (rustfs in a container)
 just dev-store
@@ -125,9 +125,25 @@ just dev-store
 open https://walgit.localhost:8080/
 ```
 
+For a deployment, Compose runs **WAL-Git** and **WAL-Github** against the bucket you provide:
+
+```sh
+cp deploy/walgit.env.example deploy/.env && "${EDITOR:-vi}" deploy/.env   # token, bucket, public origins
+docker compose -f deploy/compose.yaml up -d --build
+# WAL-Git     http://127.0.0.1:8080   token auth
+# WAL-Github  http://127.0.0.1:8097   GHES facade, loopback only
+```
+
+The stack starts no S3 service: set `WALGIT__STORE__*` in `.env` to your bucket. If you want a
+local S3-compatible endpoint for development, `deploy/compose.rustfs.yaml` is a separate Compose
+project (`just dev-store`).
+
 * `walgit.standalone.toml` — the one-machine shape (self-signed TLS, rustfs, every role). Start here.
 * `walgit.example.toml` — every key with its default and a comment.
-* `Containerfile`, `flake.nix` — an OCI image and a Nix package/devshell.
+* `docs/HOSTING.md` — running it as a service: the image, `deploy/compose.yaml`, auth/TLS, roles and
+  placement, upgrades, monitoring.
+* `Dockerfile`, `deploy/compose.yaml` (WAL-Git + WAL-Github), `deploy/compose.rustfs.yaml` (optional dev S3),
+  `flake.nix` — an OCI image, the WAL stack, a separate store, and a Nix package/devshell.
 * `deploy/nginx.conf.example` — an optional nginx in front: public TLS, one `auth_request` per credential, and
   **byte offload**: walgit answers bundle/LFS downloads with `X-Accel-Redirect` and nginx streams + caches the
   object from the bucket itself (S3 presigned or GCS with walgit's bearer). The file documents the contract.
@@ -174,7 +190,7 @@ crates/
   walgit-config   walgit.toml (+ WALGIT__ env overrides), per-repo settings merge, fail-closed validation
   walgit-cli      `walgit serve|import|compact|bundle|wal|mirror|synth|config|repo`; `walgit-server` = `walgit serve`
 web/              React SPA (Vite) + sdk/repos.ts, built into the binary; the wire contract is web/API.md
-docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, patches/
+docs/             BUNDLE_URI_DESIGN, ROUNDTRIPS (the cost model), HOSTING, POLICY, LFS, INTEGRITY, EVENTS, CONTRACT, patches/
 ```
 
 ## Invariants worth memorising

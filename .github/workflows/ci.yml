@@ -119,21 +119,31 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: useblacksmith/setup-docker-builder@v1
+      - name: Validate the WAL Compose stack
+        run: |
+          cp deploy/walgit.env.example deploy/.env
+          sed -i 's/^WALGIT_TOKEN=$/WALGIT_TOKEN=ci/' deploy/.env
+          sed -i 's/^WALGIT__STORE__BUCKET=$/WALGIT__STORE__BUCKET=ci/' deploy/.env
+          docker compose -f deploy/compose.yaml config -q
+          rm -f deploy/.env
       - name: Build release image without publishing
         uses: useblacksmith/build-push-action@v2
         with:
           context: .
-          file: Containerfile
+          file: Dockerfile
           platforms: linux/amd64
           push: false
           load: true
           provenance: false
-          build-args: WALGIT_BUILD_SHA=${{ github.sha }}
+          build-args: |
+            WALGIT_BUILD_SHA=${{ github.sha }}
+            WALGIT_CONFIG_FILE=deploy/walgithub.toml
+            WALGIT_HTTP_PORT=8097
           tags: walgithub:smoke
       - name: Start S3-compatible test store
         run: |
-          docker compose up -d --wait rustfs
-          docker compose run --rm create-bucket
+          docker compose -f deploy/compose.rustfs.yaml up -d --wait rustfs
+          docker compose -f deploy/compose.rustfs.yaml run --rm create-bucket
       - name: Start packaged facade
         run: |
           docker run -d --name walgithub-smoke --network host \
@@ -156,7 +166,7 @@ jobs:
         run: |
           mkdir -p smoke-logs
           docker logs walgithub-smoke > smoke-logs/facade.log 2>&1 || true
-          docker compose logs rustfs > smoke-logs/store.log 2>&1 || true
+          docker compose -f deploy/compose.rustfs.yaml logs rustfs > smoke-logs/store.log 2>&1 || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -167,4 +177,4 @@ jobs:
         if: always()
         run: |
           docker rm -fv walgithub-smoke || true
-          docker compose down -v
+          docker compose -f deploy/compose.rustfs.yaml down -v

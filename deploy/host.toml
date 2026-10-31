@@ -1,0 +1,46 @@
+# host.toml — the host defaults baked into the container image (Dockerfile).
+#
+#   docker build -t walgit .
+#   docker compose -f deploy/compose.yaml up -d --build   # WAL-Git + WAL-Github
+#
+# This is not a complete deployment: the bucket and the admin token come from the environment.
+# Every key can be overridden with `WALGIT__SECTION__KEY`; the Compose stack reads
+# `deploy/walgit.env.example`. Guidance: docs/HOSTING.md. Key-by-key reference: walgit.example.toml.
+#
+# Durable state is the bucket. /var/lib/walgit is a cache volume: wipe it and a host is cold,
+# never wrong.
+
+[server]
+listen = "0.0.0.0:8080"
+auto_create_on_push = true          # first push to a new owner/name creates the repository
+roles = []                          # one box: serve + maintain + events
+
+[server.auth]
+mode = "token"
+anonymous_read = false
+# The admin principal's bearer: export WALGIT_TOKEN (>= 32 random bytes) on the host.
+tokens = [{ principal = "admin", token_env = "WALGIT_TOKEN", write = true, admin = true }]
+
+[server.tls]
+mode = "off"                        # terminate TLS at the edge, or mount a cert and use mode = "files"
+
+[store]
+backend = "s3"
+bucket = ""                         # required: WALGIT__STORE__BUCKET
+prefix = ""
+
+[store.s3]
+region = "us-east-1"                # WALGIT__STORE__S3__REGION
+# Empty = the AWS SDK endpoint for the region. Set it for MinIO, rustfs, R2, Ceph.
+endpoint = ""
+force_path_style = false
+# Credentials: leave unset to use the instance/task role (D43). Set both AWS_ACCESS_KEY_ID and
+# AWS_SECRET_ACCESS_KEY to use a static pair; one alone fails closed.
+
+[cache]
+dir = "/var/lib/walgit"
+max_bytes = "20GiB"                 # budget mode: every pack, index and bundle on this disk lives here
+
+[telemetry]
+log_format = "json"
+log_filter = "info"

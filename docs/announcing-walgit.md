@@ -71,7 +71,7 @@ bytes: walgit answers a bundle or LFS download with `X-Accel-Redirect` and nginx
 from the bucket itself (S3 presigned or GCS with walgit's bearer). The example config documents the whole contract.
 
 ```sh
-nix run github:tobi/walgit -- --config walgit.toml     # or: podman build -f Containerfile .
+nix run github:tobi/walgit -- --config walgit.toml     # or: docker build -t walgit .
 ```
 
 The repository is at **github.com/tobi/walgit**, MIT licensed. `README.md` is the introduction; `AGENTS.md` is

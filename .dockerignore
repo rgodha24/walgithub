@@ -3,6 +3,9 @@ target
 **/node_modules
 web/dist
 .env*
+deploy/.env
+**/.env
+**/.env.*
 *.senv
 .senv
 .dev

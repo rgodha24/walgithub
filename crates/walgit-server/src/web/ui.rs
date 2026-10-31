@@ -21,7 +21,7 @@ use crate::error::ApiError;
 #[folder = "../../web/dist"]
 // Debug builds read the folder at runtime; `allow_missing` lets the crate
 // compile where the web build is absent (distributed sccache workers).
-// Release images assert the optimized artefacts exist (Containerfile).
+// Release images assert the optimized artefacts exist (Dockerfile).
 #[allow_missing = true]
 struct Assets;
 

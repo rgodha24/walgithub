@@ -295,5 +295,6 @@ where configured. Do not derive scheduling behavior from this interface catalog.
 ## walgit-cli (owner: Cli)
 `walgit --config walgit.toml <cmd>`: `serve` | `compact [owner/name|--all] [--once]` | `bundle run [--repo] [--strategy]` |
 `repo create|list|info` | `wal ls|show|materialize --at-seq` | `synth --out DIR --size s|m|l [--commits N --files M]`
-| `import --from GITDIR owner/name` | `config check|dump`. Also `Containerfile`, `compose.yaml` (rustfs +
-walgit), `justfile`, `walgit.example.toml`, `tests/e2e.sh` (real git vs. server on memory store and on rustfs).
+| `import --from GITDIR owner/name` | `config check|dump`. Also `Dockerfile`, `deploy/compose.yaml` (WAL-Git +
+WAL-Github; no store), `deploy/walgit.env.example`, `deploy/compose.rustfs.yaml` (separate dev store), `justfile`,
+`walgit.example.toml`, `tests/e2e.sh` (real git vs. server on memory store and on rustfs).

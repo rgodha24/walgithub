@@ -20,7 +20,7 @@ web-build:
 # https://walgit.localhost:$PORT (default 8080) against local rustfs. Self-contained: starts rustfs (+ bucket) if
 # it is not answering on :9000 and builds the SPA if web/dist is missing, then runs the server.
 # `config` defaults to walgit.standalone.toml; point it at a real bucket by editing [store] there. The rustfs
-# keys come from the environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; compose.yaml fixes them).
+# keys come from the environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; deploy/compose.rustfs.yaml fixes them).
 # Optional: export WALGIT__SERVER__AUTH__* (OIDC client, session secret) to try browser sign-in locally.
 dev-local config="walgit.standalone.toml":
     #!/usr/bin/env bash
@@ -40,7 +40,8 @@ dev-local config="walgit.standalone.toml":
     exec ./target/release/walgit-server --config {{config}}
 
 # Start rustfs (S3-compatible) for local dev via podman compose (rootless, no daemon group needed;
-# `podman compose` drives compose.yaml through the docker-compose binary dev.yml installs).
+# `podman compose` drives deploy/compose.rustfs.yaml through the docker-compose binary dev.yml installs).
+# This is a store-only Compose project, separate from the WAL deployment (deploy/compose.yaml).
 # `podman compose` talks to the podman API socket; rootless nix podman has no systemd unit for it, so
 # `podman system service` is started (detached, idle-timeout 0) when the socket is missing.
 dev-store:
@@ -58,16 +59,16 @@ dev-store:
         for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
         [ -S "$sock" ] || { echo "podman API socket did not appear; see /tmp/walgit-podman-service.log"; exit 1; }
     fi
-    podman compose up -d rustfs
+    podman compose -f deploy/compose.rustfs.yaml up -d rustfs
     echo "Waiting for rustfs to be healthy..."
-    podman compose run --rm create-bucket
+    podman compose -f deploy/compose.rustfs.yaml run --rm create-bucket
     echo "rustfs is running on http://127.0.0.1:9000 (console :9001)"
     echo "Credentials: walgit-dev / walgit-dev-secret"
     echo "Bucket: walgit-test"
 
 # Stop rustfs.
 dev-store-stop:
-    podman compose down
+    podman compose -f deploy/compose.rustfs.yaml down
 
 # --- tests -------------------------------------------------------------------
 # Tiers (all hermetic: in-memory store, tempdir caches, real `git` binary):

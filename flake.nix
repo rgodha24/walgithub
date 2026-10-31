@@ -3,7 +3,7 @@
   #
   #   nix run github:<you>/walgit -- --config walgit.toml      # run it
   #   nix build .#walgit                                       # result/bin/{walgit,walgit-server}
-  #   nix build .#image && podman load < result                # an OCI image (same bytes as the Containerfile)
+  #   nix build .#image && podman load < result                # an OCI image (same bytes as the Dockerfile)
   #   nix develop                                              # rust, protobuf, pnpm, git, just, rustfs-compatible tools
   #
   # The web UI is built from web/ with pnpm and embedded into the binary at compile time
